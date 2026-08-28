@@ -13,6 +13,7 @@ tests=(
   test-rule-generation.sh
   test-ipv6-empty-whitelist.sh
   test-chinese-tui.sh
+  test-add-rule-flow.sh
   test-ssh-protection.sh
   test-dry-run.sh
   test-apply-idempotent.sh
