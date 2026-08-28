@@ -3,7 +3,7 @@
 set -Eeuo pipefail
 umask 077
 
-readonly VERSION="1.1.0"
+readonly VERSION="1.1.1"
 readonly CHAIN="PORTSENTINEL"
 readonly STAGE_CHAIN="PORTSENTINEL_NEW"
 readonly OLD_CHAIN="PORTSENTINEL_OLD"
@@ -675,14 +675,24 @@ status_cmd() {
 
 list_rules() {
     ensure_config
-    printf '%-3s %-24s %-8s %-12s %-12s %-12s\n' ID 名称 协议 端口 IPv4 IPv6
-    jq -r '.rules | to_entries[] | [(.key+1), .value.name, (.value.protocol|ascii_upcase), .value.port,
-      ((.value.groups|join(",")) // ""), ((.value.groups|join(",")) // "")] | @tsv' "$CONFIG_FILE" |
-    while IFS=$'\t' read -r id name proto port group4 group6; do
-        [[ -n "$group4" ]] || group4="自定义/$(jq -r --argjson i "$((id-1))" '.rules[$i].ipv4_default|ascii_upcase' "$CONFIG_FILE")"
-        [[ -n "$group6" ]] || group6="自定义/$(jq -r --argjson i "$((id-1))" '.rules[$i].ipv6_default|ascii_upcase' "$CONFIG_FILE")"
-        printf '%-3s %-24.24s %-8s %-12s %-12.12s %-12.12s\n' "$id" "$name" "$proto" "$port" "$group4" "$group6"
-    done
+    if ! jq -e '.rules | length > 0' "$CONFIG_FILE" >/dev/null; then
+        info "暂无受保护端口规则。"
+        return
+    fi
+    printf '受保护端口规则：\n'
+    jq -r '
+      def protocol_label:
+        if . == "both" then "TCP + UDP" else ascii_upcase end;
+      def policy_label:
+        if . == "drop" then "未匹配时拒绝" else "未匹配时放行" end;
+      .rules | to_entries[] |
+      .value as $rule |
+      ($rule.groups | if length == 0 then "未绑定" else join(", ") end) as $groups |
+      "\n[\(.key + 1)] \($rule.name)\n" +
+      "  协议：\($rule.protocol | protocol_label)    端口：\($rule.port)\n" +
+      "  IPv4：直接地址 \($rule.sources.ipv4 | length) 个；Group：\($groups)；\($rule.ipv4_default | policy_label)\n" +
+      "  IPv6：直接地址 \($rule.sources.ipv6 | length) 个；Group：\($groups)；\($rule.ipv6_default | policy_label)"
+    ' "$CONFIG_FILE"
 }
 
 list_groups() {
@@ -724,10 +734,8 @@ add_group_address() {
     local name family address key
     read -r -p '请输入 IP Group 名称：' name
     jq -e --arg name "$name" '.groups|has($name)' "$CONFIG_FILE" >/dev/null || die "找不到该 IP Group。"
-    read -r -p '请选择地址族（4/6）：' family
-    [[ "$family" == 4 || "$family" == 6 ]] || die "地址族只能是 4 或 6。"
-    read -r -p '请输入 IP 地址或 CIDR：' address
-    validate_address "$address" "$family" || die "IPv${family} 地址或 CIDR 无效。"
+    prompt_address_family family || return 1
+    prompt_valid_address "$family" address '请输入 IP 地址或 CIDR：' || return 1
     key="ipv${family}"
     config_edit group-address-add --arg name "$name" --arg key "$key" --arg address "$address" \
       '.groups[$name][$key] = ((.groups[$name][$key] + [$address]) | unique)'
@@ -735,8 +743,10 @@ add_group_address() {
 
 remove_group_address() {
     local name family address key
-    read -r -p '请输入 IP Group 名称：' name; read -r -p '请选择地址族（4/6）：' family; read -r -p '请输入要删除的完整地址/CIDR：' address
-    [[ "$family" == 4 || "$family" == 6 ]] || die "地址族只能是 4 或 6。"
+    read -r -p '请输入 IP Group 名称：' name
+    jq -e --arg name "$name" '.groups|has($name)' "$CONFIG_FILE" >/dev/null || die "找不到该 IP Group。"
+    prompt_address_family family || return 1
+    prompt_valid_address "$family" address '请输入要删除的完整地址/CIDR：' || return 1
     key="ipv${family}"
     config_edit group-address-remove --arg name "$name" --arg key "$key" --arg address "$address" \
       '.groups[$name][$key] |= map(select(. != $address))'
@@ -763,11 +773,26 @@ delete_group() {
     config_edit group-delete --arg name "$name" 'del(.groups[$name]) | .rules |= map(.groups -= [$name])'
 }
 
+run_tui_action() {
+    if ! ( "$@" ); then
+        warn "操作未完成，已返回当前菜单，请重新选择。"
+    fi
+}
+
 groups_menu() {
     while true; do
         printf '\nIP Group 管理\n[1] 查看列表\n[2] 创建 Group\n[3] 重命名 Group\n[4] 删除 Group\n[5] 添加地址/CIDR\n[6] 删除地址/CIDR\n[0] 返回\n'
         local choice; read -r -p '> ' choice
-        case "$choice" in 1) list_groups;; 2) add_group;; 3) rename_group;; 4) delete_group;; 5) add_group_address;; 6) remove_group_address;; 0) return;; *) warn "选项无效。";; esac
+        case "$choice" in
+            1) list_groups ;;
+            2) run_tui_action add_group ;;
+            3) run_tui_action rename_group ;;
+            4) run_tui_action delete_group ;;
+            5) run_tui_action add_group_address ;;
+            6) run_tui_action remove_group_address ;;
+            0) return ;;
+            *) warn "选项无效，请重新选择。" ;;
+        esac
     done
 }
 
@@ -779,54 +804,129 @@ json_array_from_values() {
     fi
 }
 
-add_rule() {
-    local name port proto_choice protocol source_choice source_text group_json='[]'
-    local item raw group v4_sources='[]' v6_sources='[]'
-    local -a source_items=() v4_items=() v6_items=()
-    read -r -p '请输入规则名称：' name; [[ -n "$name" ]] || die "规则名称不能为空。"
-    read -r -p '请输入端口或范围（例如 10773 或 20000:20100）：' port; validate_port "$port" || die "端口无效。"
-    printf '请选择协议：[1] TCP [2] UDP [3] TCP + UDP\n'; read -r -p '> ' proto_choice
-    case "$proto_choice" in 1) protocol=tcp;; 2) protocol=udp;; 3) protocol=both;; *) die "协议选项无效。";; esac
+prompt_address_family() {
+    local output_var="$1" selected_family
+    while true; do
+        read -r -p '请选择地址族（4/6）：' selected_family || return 1
+        case "$selected_family" in
+            4|6) printf -v "$output_var" '%s' "$selected_family"; return ;;
+            *) warn "地址族只能选择 4 或 6，请重新输入。" ;;
+        esac
+    done
+}
 
-    printf '请选择白名单来源：\n[1] 直接输入 IP/CIDR\n[2] 绑定 IP Group\n[3] 暂不添加来源（阻止所有访问）\n'
-    read -r -p '> ' source_choice
-    case "$source_choice" in
-        1)
-            read -r -p '请输入允许访问的 IP/CIDR（多个用逗号分隔，可混合 IPv4 和 IPv6）：' source_text
-            [[ -n "$source_text" ]] || die "IP/CIDR 不能为空。"
-            IFS=',' read -r -a source_items <<<"$source_text"
-            for raw in "${source_items[@]}"; do
-                item="${raw#"${raw%%[![:space:]]*}"}"
-                item="${item%"${item##*[![:space:]]}"}"
-                [[ -n "$item" ]] || die "IP/CIDR 不能为空。"
-                if validate_address "$item" 4 >/dev/null 2>&1; then
-                    v4_items+=("$item")
-                elif validate_address "$item" 6 >/dev/null 2>&1; then
-                    v6_items+=("$item")
-                else
-                    die "IP/CIDR 无效：$item"
-                fi
-            done
-            v4_sources="$(json_array_from_values "${v4_items[@]}")"
-            v6_sources="$(json_array_from_values "${v6_items[@]}")"
-            info "已识别 IPv4 ${#v4_items[@]} 个、IPv6 ${#v6_items[@]} 个来源。"
-            ;;
-        2)
-            if ! jq -e '.groups | length > 0' "$CONFIG_FILE" >/dev/null; then
-                die "尚未创建 IP Group。请先在 [2] IP Group 管理中创建，或选择直接输入 IP/CIDR。"
+prompt_valid_address() {
+    local family="$1" output_var="$2" prompt="$3" selected_address
+    while true; do
+        read -r -p "$prompt" selected_address || return 1
+        if [[ -n "$selected_address" ]] && validate_address "$selected_address" "$family" >/dev/null 2>&1; then
+            printf -v "$output_var" '%s' "$selected_address"
+            return
+        fi
+        warn "请输入有效的 IPv${family} 地址或 CIDR。"
+    done
+}
+
+prompt_direct_sources() {
+    local v4_var="$1" v6_var="$2" source_text raw item invalid
+    local -a source_items=() v4_items=() v6_items=()
+    while true; do
+        read -r -p '请输入允许访问的 IP/CIDR（多个用逗号分隔，可混合 IPv4 和 IPv6）：' source_text || return 1
+        source_items=(); v4_items=(); v6_items=(); invalid=""
+        if [[ -z "$source_text" ]]; then
+            warn "IP/CIDR 不能为空，请重新输入。"
+            continue
+        fi
+        IFS=',' read -r -a source_items <<<"$source_text"
+        for raw in "${source_items[@]}"; do
+            item="${raw#"${raw%%[![:space:]]*}"}"
+            item="${item%"${item##*[![:space:]]}"}"
+            if [[ -z "$item" ]]; then
+                invalid="空值"
+            elif validate_address "$item" 4 >/dev/null 2>&1; then
+                v4_items+=("$item")
+            elif validate_address "$item" 6 >/dev/null 2>&1; then
+                v6_items+=("$item")
+            else
+                invalid="$item"
             fi
-            printf '可用 IP Group：\n'
-            jq -r '.groups | keys[] | "  - \(.)"' "$CONFIG_FILE"
-            read -r -p '请输入 IP Group 名称（多个用逗号分隔）：' source_text
-            group_json="$(printf '%s' "$source_text" | tr ',' '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//;/^$/d' | jq -R . | jq -s 'unique')"
-            [[ "$(jq 'length' <<<"$group_json")" -gt 0 ]] || die "IP Group 名称不能为空。"
-            while IFS= read -r group; do
-                jq -e --arg group "$group" '.groups | has($group)' "$CONFIG_FILE" >/dev/null || die "找不到 IP Group：$group"
-            done < <(jq -r '.[]' <<<"$group_json")
-            ;;
-        3) ;;
-        *) die "白名单来源选项无效。" ;;
-    esac
+            [[ -z "$invalid" ]] || break
+        done
+        if [[ -n "$invalid" ]]; then
+            warn "IP/CIDR 无效：${invalid}，请重新输入整组地址。"
+            continue
+        fi
+        printf -v "$v4_var" '%s' "$(json_array_from_values "${v4_items[@]}")"
+        printf -v "$v6_var" '%s' "$(json_array_from_values "${v6_items[@]}")"
+        info "已识别 IPv4 ${#v4_items[@]} 个、IPv6 ${#v6_items[@]} 个来源。"
+        return
+    done
+}
+
+prompt_rule_groups() {
+    local output_var="$1" source_text candidate group missing
+    if ! jq -e '.groups | length > 0' "$CONFIG_FILE" >/dev/null; then
+        warn "尚未创建 IP Group。请先创建 Group，或改选直接输入 IP/CIDR。"
+        return 1
+    fi
+    printf '可用 IP Group：\n'
+    jq -r '.groups | keys[] | "  - \(.)"' "$CONFIG_FILE"
+    while true; do
+        read -r -p '请输入 IP Group 名称（多个用逗号分隔）：' source_text || return 1
+        candidate="$(printf '%s' "$source_text" | tr ',' '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//;/^$/d' | jq -R . | jq -s 'unique')"
+        if [[ "$(jq 'length' <<<"$candidate")" -eq 0 ]]; then
+            warn "IP Group 名称不能为空，请重新输入。"
+            continue
+        fi
+        missing=""
+        while IFS= read -r group; do
+            if ! jq -e --arg group "$group" '.groups | has($group)' "$CONFIG_FILE" >/dev/null; then
+                missing="$group"
+                break
+            fi
+        done < <(jq -r '.[]' <<<"$candidate")
+        if [[ -n "$missing" ]]; then
+            warn "找不到 IP Group：${missing}，请重新输入。"
+            continue
+        fi
+        printf -v "$output_var" '%s' "$candidate"
+        return
+    done
+}
+
+add_rule() {
+    local name port proto_choice protocol source_choice group_json='[]'
+    local v4_sources='[]' v6_sources='[]'
+    while true; do
+        read -r -p '请输入规则名称：' name || return 1
+        [[ -n "$name" ]] && break
+        warn "规则名称不能为空，请重新输入。"
+    done
+    while true; do
+        read -r -p '请输入端口或范围（例如 10773 或 20000:20100）：' port || return 1
+        validate_port "$port" && break
+        warn "端口无效，请重新输入。"
+    done
+    while true; do
+        printf '请选择协议：[1] TCP [2] UDP [3] TCP + UDP\n'; read -r -p '> ' proto_choice || return 1
+        case "$proto_choice" in
+            1) protocol=tcp; break ;;
+            2) protocol=udp; break ;;
+            3) protocol=both; break ;;
+            *) warn "协议选项无效，请重新选择。" ;;
+        esac
+    done
+
+    while true; do
+        printf '请选择白名单来源：\n[1] 直接输入 IP/CIDR\n[2] 绑定 IP Group\n[3] 暂不添加来源（阻止所有访问）\n'
+        read -r -p '> ' source_choice || return 1
+        case "$source_choice" in
+            1) prompt_direct_sources v4_sources v6_sources && break ;;
+            2) prompt_rule_groups group_json && break ;;
+            3) break ;;
+            *) warn "白名单来源选项无效，请重新选择。" ;;
+        esac
+    done
 
     config_edit rule-add --arg name "$name" --arg protocol "$protocol" --arg port "$port" \
       --argjson groups "$group_json" --argjson v4 "$v4_sources" --argjson v6 "$v6_sources" \
@@ -838,11 +938,16 @@ add_rule() {
 read_rule_index() {
     local index_var="$1" selected_id count
     list_rules
-    read -r -p '请输入规则 ID：' selected_id
-    [[ "$selected_id" =~ ^[0-9]+$ ]] || die "规则 ID 无效。"
     count="$(jq '.rules|length' "$CONFIG_FILE")"
-    (( selected_id >= 1 && selected_id <= count )) || die "规则 ID 超出范围。"
-    printf -v "$index_var" '%s' "$((selected_id-1))"
+    (( count > 0 )) || return 1
+    while true; do
+        read -r -p '请输入规则 ID：' selected_id || return 1
+        if [[ "$selected_id" =~ ^[0-9]+$ ]] && (( selected_id >= 1 && selected_id <= count )); then
+            printf -v "$index_var" '%s' "$((selected_id-1))"
+            return
+        fi
+        warn "规则 ID 无效，请输入 1-${count}。"
+    done
 }
 
 edit_rule() {
@@ -874,19 +979,21 @@ edit_rule() {
 
 add_rule_source() {
     local index family address key
-    read_rule_index index
-    read -r -p '请选择地址族（4/6）：' family; [[ "$family" == 4 || "$family" == 6 ]] || die "地址族只能是 4 或 6。"
-    read -r -p '请输入地址或 CIDR：' address; validate_address "$address" "$family" || die "地址无效。"
+    read_rule_index index || return 1
+    prompt_address_family family || return 1
+    prompt_valid_address "$family" address '请输入地址或 CIDR：' || return 1
     key="ipv${family}"
     config_edit rule-source-add --argjson i "$index" --arg key "$key" --arg address "$address" \
       '.rules[$i].sources[$key] = ((.rules[$i].sources[$key] + [$address]) | unique)'
+    info "来源已添加。请返回主菜单选择 [6] 应用配置。"
 }
 
 remove_rule_source() {
     local index family address key
-    read_rule_index index
-    read -r -p '请选择地址族（4/6）：' family; [[ "$family" == 4 || "$family" == 6 ]] || die "地址族只能是 4 或 6。"
-    read -r -p '请输入完整地址或 CIDR：' address; key="ipv${family}"
+    read_rule_index index || return 1
+    prompt_address_family family || return 1
+    prompt_valid_address "$family" address '请输入完整地址或 CIDR：' || return 1
+    key="ipv${family}"
     config_edit rule-source-remove --argjson i "$index" --arg key "$key" --arg address "$address" \
       '.rules[$i].sources[$key] |= map(select(. != $address))'
 }
@@ -918,8 +1025,16 @@ protected_ports_menu() {
         printf '\n受保护端口管理\n[1] 查看列表/详情\n[2] 添加端口保护\n[3] 编辑规则\n[4] 删除规则\n[5] 添加来源\n[6] 删除来源\n[7] 绑定 IP Group\n[8] 解绑 IP Group\n[0] 返回\n'
         local choice; read -r -p '> ' choice
         case "$choice" in
-            1) list_rules;; 2) add_rule;; 3) edit_rule;; 4) delete_rule;; 5) add_rule_source;; 6) remove_rule_source;;
-            7) attach_rule_group;; 8) detach_rule_group;; 0) return;; *) warn "选项无效。";;
+            1) list_rules ;;
+            2) run_tui_action add_rule ;;
+            3) run_tui_action edit_rule ;;
+            4) run_tui_action delete_rule ;;
+            5) run_tui_action add_rule_source ;;
+            6) run_tui_action remove_rule_source ;;
+            7) run_tui_action attach_rule_group ;;
+            8) run_tui_action detach_rule_group ;;
+            0) return ;;
+            *) warn "选项无效，请重新选择。" ;;
         esac
     done
 }
@@ -959,10 +1074,26 @@ tui() {
         printf ' [1] 受保护端口\n [2] IP Group 管理\n [3] 添加端口保护\n [4] 删除规则\n [5] 查看有效规则\n [6] 应用配置\n [7] 备份 / 恢复\n [8] 防火墙状态\n [9] 重置 PortSentinel 规则\n\n [u] 一键更新\n [0] 退出\n\n'
         local choice; read -r -p '> ' choice
         case "$choice" in
-            1) protected_ports_menu;; 2) groups_menu;; 3) add_rule;; 4) delete_rule;;
-            5) effective_rules_cmd;; 6) apply_cmd;;
-            7) printf '[1] 创建备份 [2] 恢复备份\n'; read -r -p '> ' choice; if [[ "$choice" == 1 ]]; then backup_cmd; else restore_cmd; fi;;
-            8) status_cmd;; 9) reset_cmd;; u|U) update_cmd;; 0) return;; *) warn "选项无效。";;
+            1) protected_ports_menu ;;
+            2) groups_menu ;;
+            3) run_tui_action add_rule ;;
+            4) run_tui_action delete_rule ;;
+            5) run_tui_action effective_rules_cmd ;;
+            6) run_tui_action apply_cmd ;;
+            7)
+                printf '[1] 创建备份 [2] 恢复备份\n'
+                read -r -p '> ' choice
+                case "$choice" in
+                    1) run_tui_action backup_cmd ;;
+                    2) run_tui_action restore_cmd ;;
+                    *) warn "选项无效，请重新选择。" ;;
+                esac
+                ;;
+            8) run_tui_action status_cmd ;;
+            9) run_tui_action reset_cmd ;;
+            u|U) run_tui_action update_cmd ;;
+            0) return ;;
+            *) warn "选项无效，请重新选择。" ;;
         esac
         read -r -p '按 Enter 键继续...' _ || true
     done
