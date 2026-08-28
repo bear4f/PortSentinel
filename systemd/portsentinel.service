@@ -1,0 +1,19 @@
+[Unit]
+Description=PortSentinel dual-stack port whitelist manager
+Documentation=https://github.com/bear4f/PortSentinel
+DefaultDependencies=no
+After=local-fs.target
+Before=network-pre.target
+Wants=network-pre.target
+ConditionPathExists=/etc/portsentinel/config.json
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/portsentinel apply --non-interactive
+RemainAfterExit=yes
+TimeoutStartSec=90
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

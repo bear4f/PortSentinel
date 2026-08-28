@@ -1,0 +1,993 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+umask 077
+
+readonly VERSION="1.0.0"
+readonly CHAIN="PORTSENTINEL"
+readonly STAGE_CHAIN="PORTSENTINEL_NEW"
+readonly OLD_CHAIN="PORTSENTINEL_OLD"
+
+CONFIG_DIR="${PORTSENTINEL_CONFIG_DIR:-/etc/portsentinel}"
+CONFIG_FILE="${PORTSENTINEL_CONFIG_FILE:-${CONFIG_DIR}/config.json}"
+BACKUP_DIR="${PORTSENTINEL_BACKUP_DIR:-${CONFIG_DIR}/backups}"
+CONF_FILE="${PORTSENTINEL_CONF_FILE:-${CONFIG_DIR}/portsentinel.conf}"
+LOG_FILE="${PORTSENTINEL_LOG_FILE:-/var/log/portsentinel.log}"
+LOCK_FILE="${PORTSENTINEL_LOCK_FILE:-/run/portsentinel.lock}"
+IPTABLES="${PORTSENTINEL_IPTABLES:-iptables}"
+IP6TABLES="${PORTSENTINEL_IP6TABLES:-ip6tables}"
+IPTABLES_SAVE="${PORTSENTINEL_IPTABLES_SAVE:-iptables-save}"
+IP6TABLES_SAVE="${PORTSENTINEL_IP6TABLES_SAVE:-ip6tables-save}"
+IPTABLES_RESTORE="${PORTSENTINEL_IPTABLES_RESTORE:-iptables-restore}"
+IP6TABLES_RESTORE="${PORTSENTINEL_IP6TABLES_RESTORE:-ip6tables-restore}"
+IP_CMD="${PORTSENTINEL_IP:-ip}"
+SS_CMD="${PORTSENTINEL_SS:-ss}"
+FLOCK_CMD="${PORTSENTINEL_FLOCK:-flock}"
+UPDATE_INSTALLER_URL="${PORTSENTINEL_UPDATE_URL:-https://raw.githubusercontent.com/bear4f/PortSentinel/main/install.sh}"
+BACKUP_KEEP="${PORTSENTINEL_BACKUP_KEEP:-20}"
+if [[ -r "$CONF_FILE" ]]; then
+    configured_keep="$(awk -F= '$1 == "BACKUP_KEEP" {print $2; exit}' "$CONF_FILE")"
+    [[ "$configured_keep" =~ ^[0-9]+$ ]] && BACKUP_KEEP="$configured_keep"
+fi
+[[ "$BACKUP_KEEP" =~ ^[0-9]+$ ]] || BACKUP_KEEP=20
+
+NON_INTERACTIVE=0
+DRY_RUN=0
+PRESERVE_CURRENT_SSH=0
+TRANSACTION_ACTIVE=0
+TRANSACTION_BACKUP=""
+SKIP_IPV6=0
+PRESERVE_SSH_SOURCE=""
+PRESERVE_SSH_FAMILY=0
+PRESERVE_SSH_PORT=0
+declare -a RULES_V4=()
+declare -a RULES_V6=()
+
+color() {
+    if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then printf '\033[%sm' "$1"; fi
+}
+
+info() { printf '%s[INFO]%s %s\n' "$(color '1;34')" "$(color 0)" "$*"; }
+warn() { printf '%s[WARN]%s %s\n' "$(color '1;33')" "$(color 0)" "$*" >&2; }
+die() { printf '%s[ERROR]%s %s\n' "$(color '1;31')" "$(color 0)" "$*" >&2; exit 1; }
+
+log_event() {
+    local operation="$1" result="$2" detail="${3:-}"
+    local line
+    line="$(date -u '+%Y-%m-%dT%H:%M:%SZ') operation=${operation} result=${result} ${detail}"
+    if [[ -w "$LOG_FILE" || ( ! -e "$LOG_FILE" && -w "$(dirname "$LOG_FILE")" ) ]]; then
+        printf '%s\n' "$line" >>"$LOG_FILE" 2>/dev/null || true
+    fi
+}
+
+need_command() { command -v "$1" >/dev/null 2>&1 || die "Required command not found: $1"; }
+
+require_base_dependencies() {
+    need_command bash
+    need_command jq
+    need_command python3
+}
+
+require_root() {
+    if [[ "${EUID}" -ne 0 && "${PORTSENTINEL_ALLOW_NON_ROOT:-0}" != 1 ]]; then
+        die "This operation must run as root."
+    fi
+}
+
+acquire_lock() {
+    need_command "$FLOCK_CMD"
+    mkdir -p "$(dirname "$LOCK_FILE")"
+    exec 9>"$LOCK_FILE"
+    "$FLOCK_CMD" -n 9 || die "Another PortSentinel operation is running."
+}
+
+default_config() {
+    printf '%s\n' '{"version":1,"groups":{},"rules":[]}'
+}
+
+ensure_config() {
+    if [[ ! -f "$CONFIG_FILE" ]]; then
+        require_root
+        install -d -m 700 "$CONFIG_DIR" "$BACKUP_DIR"
+        default_config >"$CONFIG_FILE"
+        chmod 600 "$CONFIG_FILE"
+        log_event config-create success
+    fi
+}
+
+validate_address() {
+    local address="$1" family="${2:-0}"
+    python3 - "$address" "$family" <<'PY'
+import ipaddress, sys
+try:
+    value = sys.argv[1]
+    expected = int(sys.argv[2])
+    obj = ipaddress.ip_network(value, strict=False) if "/" in value else ipaddress.ip_address(value)
+    if expected and obj.version != expected:
+        raise ValueError("wrong address family")
+except ValueError as exc:
+    print(exc, file=sys.stderr)
+    raise SystemExit(1)
+PY
+}
+
+validate_port() {
+    local spec="$1" first last
+    if [[ "$spec" =~ ^([0-9]+)$ ]]; then
+        first="${BASH_REMATCH[1]}"; last="$first"
+    elif [[ "$spec" =~ ^([0-9]+):([0-9]+)$ ]]; then
+        first="${BASH_REMATCH[1]}"; last="${BASH_REMATCH[2]}"
+    else
+        return 1
+    fi
+    (( 10#$first >= 1 && 10#$first <= 65535 && 10#$last >= 1 && 10#$last <= 65535 && 10#$first <= 10#$last ))
+}
+
+validate_config() {
+    local file="${1:-$CONFIG_FILE}"
+    [[ -r "$file" ]] || { warn "Configuration not readable: $file"; return 1; }
+    jq -e '
+      . as $cfg |
+      type == "object" and .version == 1 and
+      (.groups | type == "object") and (.rules | type == "array") and
+      all(.groups | to_entries[];
+        (.key | test("^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")) and
+        (.value | type == "object") and
+        (.value.ipv4 | type == "array" and all(.[]; type == "string")) and
+        (.value.ipv6 | type == "array" and all(.[]; type == "string"))) and
+      all(.rules[];
+        (.name | type == "string" and length > 0 and length <= 80) and
+        (.protocol == "tcp" or .protocol == "udp" or .protocol == "both") and
+        (.port | type == "string") and
+        (.groups | type == "array" and all(.[]; type == "string")) and
+        (.sources | type == "object") and
+        (.sources.ipv4 | type == "array" and all(.[]; type == "string")) and
+        (.sources.ipv6 | type == "array" and all(.[]; type == "string")) and
+        (.ipv4_default == "drop" or .ipv4_default == "accept") and
+        (.ipv6_default == "drop" or .ipv6_default == "accept")) and
+      all(.rules[].groups[]; . as $g | $cfg.groups | has($g))
+    ' "$file" >/dev/null || { warn "Invalid configuration schema."; return 1; }
+
+    python3 - "$file" <<'PY'
+import ipaddress, json, re, sys
+
+with open(sys.argv[1], encoding="utf-8") as fh:
+    cfg = json.load(fh)
+
+def address(value, family, where):
+    try:
+        obj = ipaddress.ip_network(value, strict=False) if "/" in value else ipaddress.ip_address(value)
+    except ValueError as exc:
+        raise SystemExit(f"Invalid {where} address {value!r}: {exc}")
+    if obj.version != family:
+        raise SystemExit(f"Wrong address family in {where}: {value!r}")
+
+def ports(value):
+    match = re.fullmatch(r"([0-9]+)(?::([0-9]+))?", value)
+    if not match:
+        raise SystemExit(f"Invalid port: {value!r}")
+    start = int(match.group(1)); end = int(match.group(2) or start)
+    if not (1 <= start <= end <= 65535):
+        raise SystemExit(f"Invalid port range: {value!r}")
+    return start, end
+
+for name, group in cfg["groups"].items():
+    for family in (4, 6):
+        values = group[f"ipv{family}"]
+        if len(values) != len(set(values)):
+            raise SystemExit(f"Duplicate address in group {name!r} IPv{family}")
+        for value in values:
+            address(value, family, f"group {name!r} IPv{family}")
+
+seen_names = set()
+coverage = {"tcp": [], "udp": []}
+for rule in cfg["rules"]:
+    if rule["name"] in seen_names:
+        raise SystemExit(f"Duplicate rule name: {rule['name']!r}")
+    seen_names.add(rule["name"])
+    start, end = ports(rule["port"])
+    protocols = ("tcp", "udp") if rule["protocol"] == "both" else (rule["protocol"],)
+    for proto in protocols:
+        for old_start, old_end, old_name in coverage[proto]:
+            if max(start, old_start) <= min(end, old_end):
+                raise SystemExit(f"Overlapping {proto.upper()} ports: {rule['name']!r} and {old_name!r}")
+        coverage[proto].append((start, end, rule["name"]))
+    if len(rule["groups"]) != len(set(rule["groups"])):
+        raise SystemExit(f"Duplicate group reference in rule {rule['name']!r}")
+    for family in (4, 6):
+        values = rule["sources"][f"ipv{family}"]
+        if len(values) != len(set(values)):
+            raise SystemExit(f"Duplicate source in rule {rule['name']!r} IPv{family}")
+        for value in values:
+            address(value, family, f"rule {rule['name']!r} IPv{family}")
+PY
+}
+
+atomic_replace_config() {
+    local candidate="$1"
+    validate_config "$candidate" || { rm -f "$candidate"; return 1; }
+    python3 - "$candidate" <<'PY'
+import os, sys
+fd = os.open(sys.argv[1], os.O_RDONLY)
+try: os.fsync(fd)
+finally: os.close(fd)
+PY
+    chmod 600 "$candidate"
+    mv -f "$candidate" "$CONFIG_FILE"
+    python3 - "$CONFIG_DIR" <<'PY'
+import os, sys
+fd = os.open(sys.argv[1], os.O_RDONLY)
+try: os.fsync(fd)
+finally: os.close(fd)
+PY
+}
+
+config_edit() {
+    local operation="$1"; shift
+    local temp
+    temp="$(mktemp "${CONFIG_DIR}/config.json.tmp.XXXXXX")"
+    if jq "$@" "$CONFIG_FILE" >"$temp" && atomic_replace_config "$temp"; then
+        log_event "$operation" success
+    else
+        rm -f "$temp"
+        log_event "$operation" failure
+        return 1
+    fi
+}
+
+collect_sources() {
+    local rule_index="$1" family="$2"
+    jq -r --argjson i "$rule_index" --arg fam "ipv${family}" '
+      .rules[$i] as $r |
+      ([$r.sources[$fam][]] + [$r.groups[] as $g | .groups[$g][$fam][]]) |
+      unique[]
+    ' "$CONFIG_FILE"
+}
+
+generate_rules() {
+    RULES_V4=(); RULES_V6=()
+    local count index protocol port default4 default6 proto source
+    count="$(jq '.rules | length' "$CONFIG_FILE")"
+    for ((index=0; index<count; index++)); do
+        protocol="$(jq -r --argjson i "$index" '.rules[$i].protocol' "$CONFIG_FILE")"
+        port="$(jq -r --argjson i "$index" '.rules[$i].port' "$CONFIG_FILE")"
+        default4="$(jq -r --argjson i "$index" '.rules[$i].ipv4_default' "$CONFIG_FILE")"
+        default6="$(jq -r --argjson i "$index" '.rules[$i].ipv6_default' "$CONFIG_FILE")"
+        local -a protocols=()
+        if [[ "$protocol" == both ]]; then protocols=(tcp udp); else protocols=("$protocol"); fi
+        for proto in "${protocols[@]}"; do
+            local port_begin port_end
+            if [[ "$port" == *:* ]]; then port_begin="${port%%:*}"; port_end="${port##*:}"; else port_begin="$port"; port_end="$port"; fi
+            if [[ "$proto" == tcp && "$PRESERVE_SSH_FAMILY" == 4 ]] && (( PRESERVE_SSH_PORT >= 10#$port_begin && PRESERVE_SSH_PORT <= 10#$port_end )); then
+                RULES_V4+=("-A ${STAGE_CHAIN} -p tcp --dport ${port} -s ${PRESERVE_SSH_SOURCE} -j ACCEPT")
+            fi
+            while IFS= read -r source; do
+                [[ -n "$source" ]] && RULES_V4+=("-A ${STAGE_CHAIN} -p ${proto} --dport ${port} -s ${source} -j ACCEPT")
+            done < <(collect_sources "$index" 4)
+            if [[ "$default4" == drop ]]; then
+                RULES_V4+=("-A ${STAGE_CHAIN} -p ${proto} --dport ${port} -j DROP")
+            else
+                RULES_V4+=("-A ${STAGE_CHAIN} -p ${proto} --dport ${port} -j RETURN")
+            fi
+
+            if [[ "$proto" == tcp && "$PRESERVE_SSH_FAMILY" == 6 ]] && (( PRESERVE_SSH_PORT >= 10#$port_begin && PRESERVE_SSH_PORT <= 10#$port_end )); then
+                RULES_V6+=("-A ${STAGE_CHAIN} -p tcp --dport ${port} -s ${PRESERVE_SSH_SOURCE} -j ACCEPT")
+            fi
+            while IFS= read -r source; do
+                [[ -n "$source" ]] && RULES_V6+=("-A ${STAGE_CHAIN} -p ${proto} --dport ${port} -s ${source} -j ACCEPT")
+            done < <(collect_sources "$index" 6)
+            if [[ "$default6" == drop ]]; then
+                RULES_V6+=("-A ${STAGE_CHAIN} -p ${proto} --dport ${port} -j DROP")
+            else
+                RULES_V6+=("-A ${STAGE_CHAIN} -p ${proto} --dport ${port} -j RETURN")
+            fi
+        done
+    done
+    RULES_V4+=("-A ${STAGE_CHAIN} -j RETURN")
+    RULES_V6+=("-A ${STAGE_CHAIN} -j RETURN")
+}
+
+print_dry_run_family() {
+    local family="$1" bin="$2" array_name="$3"
+    local -a rules_ref=()
+    if [[ "$array_name" == RULES_V4 ]]; then rules_ref=("${RULES_V4[@]}"); else rules_ref=("${RULES_V6[@]}"); fi
+    printf '===== IPv%s =====\n' "$family"
+    printf '%q -w 5 -N %q\n' "$bin" "$STAGE_CHAIN"
+    local rule
+    for rule in "${rules_ref[@]}"; do printf '%q -w 5 %s\n' "$bin" "$rule"; done
+    printf '# Atomic switch: INPUT jump -> %s, remove old chain, rename staging chain -> %s\n\n' "$STAGE_CHAIN" "$CHAIN"
+}
+
+ipv6_state() {
+    if [[ -r /proc/sys/net/ipv6/conf/all/disable_ipv6 ]] && [[ "$(< /proc/sys/net/ipv6/conf/all/disable_ipv6)" == 1 ]]; then
+        printf 'disabled'; return
+    fi
+    if command -v "$IP_CMD" >/dev/null 2>&1 && ! "$IP_CMD" -6 addr show >/dev/null 2>&1; then
+        printf 'disabled'; return
+    fi
+    printf 'enabled'
+}
+
+family_chain_exists() { "$1" -w 5 -nL "$2" >/dev/null 2>&1; }
+
+cleanup_staging() {
+    local bin="$1"
+    local temp line
+    for temp in "$STAGE_CHAIN" "$OLD_CHAIN"; do
+        family_chain_exists "$bin" "$temp" || continue
+        if "$bin" -w 5 -C INPUT -j "$temp" >/dev/null 2>&1; then
+            if family_chain_exists "$bin" "$CHAIN"; then
+                while "$bin" -w 5 -C INPUT -j "$temp" >/dev/null 2>&1; do
+                    line="$($bin -w 5 -L INPUT -n --line-numbers 2>/dev/null | awk -v chain="$temp" '$2 == chain { print $1; exit }')"
+                    [[ -n "$line" ]] || return 1
+                    "$bin" -w 5 -R INPUT "$line" -j "$CHAIN" || return 1
+                done
+            elif [[ "$temp" == "$STAGE_CHAIN" ]]; then
+                "$bin" -w 5 -E "$STAGE_CHAIN" "$CHAIN" || return 1
+                continue
+            else
+                warn "Cannot safely recover referenced chain ${OLD_CHAIN} without ${CHAIN}."
+                return 1
+            fi
+        fi
+        "$bin" -w 5 -F "$temp" >/dev/null 2>&1 || return 1
+        "$bin" -w 5 -X "$temp" >/dev/null 2>&1 || return 1
+    done
+}
+
+stage_family() {
+    local bin="$1" array_name="$2" family="$3"
+    local -a rules_ref=()
+    if [[ "$array_name" == RULES_V4 ]]; then rules_ref=("${RULES_V4[@]}"); else rules_ref=("${RULES_V6[@]}"); fi
+    local rule
+    cleanup_staging "$bin" || return 1
+    "$bin" -w 5 -N "$STAGE_CHAIN" || return 1
+    for rule in "${rules_ref[@]}"; do
+        local -a args=()
+        read -r -a args <<<"$rule"
+        "$bin" -w 5 "${args[@]}" || return 1
+    done
+    info "IPv${family} candidate validated and staged."
+}
+
+switch_family() {
+    local bin="$1" family="$2" first_line
+    first_line="$($bin -w 5 -L INPUT -n --line-numbers 2>/dev/null | awk -v chain="$CHAIN" '$2 == chain { print $1; exit }')"
+    if [[ -n "$first_line" ]]; then
+        "$bin" -w 5 -R INPUT "$first_line" -j "$STAGE_CHAIN" || return 1
+        while "$bin" -w 5 -C INPUT -j "$CHAIN" >/dev/null 2>&1; do
+            "$bin" -w 5 -D INPUT -j "$CHAIN" || return 1
+        done
+    else
+        "$bin" -w 5 -I INPUT 1 -j "$STAGE_CHAIN" || return 1
+    fi
+
+    if family_chain_exists "$bin" "$CHAIN"; then
+        "$bin" -w 5 -F "$CHAIN" || return 1
+        "$bin" -w 5 -X "$CHAIN" || return 1
+    fi
+    "$bin" -w 5 -E "$STAGE_CHAIN" "$CHAIN" || return 1
+    info "IPv${family} policy applied."
+}
+
+rotate_backups() {
+    local -a sets=()
+    local file stamp
+    shopt -s nullglob
+    for file in "$BACKUP_DIR"/*.ipv4.rules; do sets+=("$file"); done
+    shopt -u nullglob
+    if (( ${#sets[@]} <= BACKUP_KEEP )); then return; fi
+    IFS=$'\n' sets=($(printf '%s\n' "${sets[@]}" | sort)); unset IFS
+    local remove_count=$(( ${#sets[@]} - BACKUP_KEEP )) i
+    for ((i=0; i<remove_count; i++)); do
+        file="${sets[$i]}"; stamp="${file%.ipv4.rules}"
+        rm -f -- "${stamp}.ipv4.rules" "${stamp}.ipv6.rules"
+    done
+}
+
+create_backup() {
+    local requested="${1:-}" base stamp suffix=0
+    if [[ -n "$requested" ]]; then
+        stamp="$requested"
+    else
+        base="$(date -u '+%Y%m%d-%H%M%S')"; stamp="$base"
+        while [[ -e "${BACKUP_DIR}/${stamp}.ipv4.rules" || -e "${BACKUP_DIR}/${stamp}.ipv6.rules" ]]; do
+            ((suffix+=1)); stamp="${base}-${suffix}"
+        done
+    fi
+    install -d -m 700 "$BACKUP_DIR"
+    local v4="${BACKUP_DIR}/${stamp}.ipv4.rules" v6="${BACKUP_DIR}/${stamp}.ipv6.rules"
+    "$IPTABLES_SAVE" >"${v4}.tmp"
+    if command -v "$IP6TABLES_SAVE" >/dev/null 2>&1; then
+        "$IP6TABLES_SAVE" >"${v6}.tmp"
+    else
+        printf '# IPv6 firewall unavailable when this backup was created\n' >"${v6}.tmp"
+    fi
+    chmod 600 "${v4}.tmp" "${v6}.tmp"
+    mv -f "${v4}.tmp" "$v4"
+    mv -f "${v6}.tmp" "$v6"
+    TRANSACTION_BACKUP="$stamp"
+    rotate_backups
+    log_event backup success "set=${stamp}"
+    printf '%s\n' "$stamp"
+}
+
+restore_backup_set() {
+    local stamp="$1"
+    local v4="${BACKUP_DIR}/${stamp}.ipv4.rules" v6="${BACKUP_DIR}/${stamp}.ipv6.rules"
+    [[ -r "$v4" && -r "$v6" ]] || return 1
+    "$IPTABLES_RESTORE" <"$v4" || return 1
+    if ! grep -q '^# IPv6 firewall unavailable' "$v6"; then
+        command -v "$IP6TABLES_RESTORE" >/dev/null 2>&1 || return 1
+        "$IP6TABLES_RESTORE" <"$v6" || return 1
+    fi
+}
+
+rollback_transaction() {
+    local reason="${1:-failure}"
+    if [[ "$TRANSACTION_ACTIVE" == 1 && -n "$TRANSACTION_BACKUP" ]]; then
+        warn "Rolling back IPv4 and IPv6 to backup ${TRANSACTION_BACKUP} (${reason})."
+        if restore_backup_set "$TRANSACTION_BACKUP"; then
+            log_event rollback success "set=${TRANSACTION_BACKUP} reason=${reason}"
+        else
+            log_event rollback failure "set=${TRANSACTION_BACKUP} reason=${reason}"
+            warn "Automatic rollback failed; restore backup ${TRANSACTION_BACKUP} manually."
+        fi
+        TRANSACTION_ACTIVE=0
+    fi
+}
+
+on_signal() { rollback_transaction "signal-$1"; exit 130; }
+trap 'on_signal INT' INT
+trap 'on_signal TERM' TERM
+
+address_contains() {
+    local source="$1" candidate="$2"
+    python3 - "$source" "$candidate" <<'PY'
+import ipaddress, sys
+source = ipaddress.ip_address(sys.argv[1])
+network = ipaddress.ip_network(sys.argv[2], strict=False)
+raise SystemExit(0 if source in network else 1)
+PY
+}
+
+ssh_source_allowed() {
+    local source="$1" server_port="$2" family="$3"
+    local count index spec protocol default begin end candidate
+    count="$(jq '.rules | length' "$CONFIG_FILE")"
+    for ((index=0; index<count; index++)); do
+        protocol="$(jq -r --argjson i "$index" '.rules[$i].protocol' "$CONFIG_FILE")"
+        [[ "$protocol" == tcp || "$protocol" == both ]] || continue
+        spec="$(jq -r --argjson i "$index" '.rules[$i].port' "$CONFIG_FILE")"
+        if [[ "$spec" == *:* ]]; then begin="${spec%%:*}"; end="${spec##*:}"; else begin="$spec"; end="$spec"; fi
+        (( server_port >= 10#$begin && server_port <= 10#$end )) || continue
+        default="$(jq -r --argjson i "$index" --arg fam "ipv${family}_default" '.rules[$i][$fam]' "$CONFIG_FILE")"
+        [[ "$default" == accept ]] && return 0
+        while IFS= read -r candidate; do
+            if address_contains "$source" "$candidate"; then return 0; fi
+        done < <(collect_sources "$index" "$family")
+        return 1
+    done
+    return 0
+}
+
+ssh_lockout_check() {
+    local source source_port server_port extra family
+    if [[ -n "${SSH_CONNECTION:-}" ]]; then
+        read -r source source_port _ server_port extra <<<"$SSH_CONNECTION"
+    elif [[ -n "${SSH_CLIENT:-}" ]]; then
+        read -r source source_port server_port extra <<<"$SSH_CLIENT"
+    else
+        return 0
+    fi
+    [[ -z "${extra:-}" && "$server_port" =~ ^[0-9]+$ ]] || { warn "Unable to parse SSH connection metadata; refusing interactive apply."; return 1; }
+    if validate_address "$source" 4 >/dev/null 2>&1; then family=4
+    elif validate_address "$source" 6 >/dev/null 2>&1; then family=6
+    else warn "Invalid SSH source in SSH_CONNECTION: $source"; return 1
+    fi
+    if command -v "$SS_CMD" >/dev/null 2>&1; then
+        if "$SS_CMD" -lntpH 2>/dev/null | awk -v suffix=":${server_port}" '$4 ~ (suffix "$") {found=1} END {exit !found}'; then
+            info "Verified active SSH listener on TCP/${server_port} with ss -lntp."
+        else
+            warn "ss -lntp did not expose TCP/${server_port}; using authenticated SSH session metadata."
+        fi
+    fi
+    if ssh_source_allowed "$source" "$server_port" "$family"; then return 0; fi
+
+    printf '\n%sCRITICAL WARNING%s\n\n' "$(color '1;31')" "$(color 0)" >&2
+    printf 'Current SSH session: %s -> TCP/%s\n' "$source" "$server_port" >&2
+    printf 'The current SSH source is not permitted by the new PortSentinel rule.\n' >&2
+    printf 'Applying this policy may terminate your SSH session.\n\n' >&2
+    if [[ "$PRESERVE_CURRENT_SSH" == 1 ]]; then
+        PRESERVE_SSH_SOURCE="$source"; PRESERVE_SSH_FAMILY="$family"; PRESERVE_SSH_PORT="$server_port"
+        info "Current SSH source will be inserted into this candidate only; config.json is unchanged."
+        return 0
+    fi
+    [[ "$NON_INTERACTIVE" == 0 ]] || return 1
+    local answer
+    read -r -p 'Type PRESERVE CURRENT SSH for a one-apply exception, or APPLY ANYWAY: ' answer
+    case "$answer" in
+        'PRESERVE CURRENT SSH')
+            PRESERVE_SSH_SOURCE="$source"; PRESERVE_SSH_FAMILY="$family"; PRESERVE_SSH_PORT="$server_port"
+            info "Current SSH source will be inserted into this candidate only; config.json is unchanged."
+            ;;
+        'APPLY ANYWAY') ;;
+        *) return 1 ;;
+    esac
+}
+
+preflight_apply() {
+    require_base_dependencies
+    validate_config
+    if (( DRY_RUN )); then generate_rules; return 0; fi
+    require_root
+    need_command "$IPTABLES"
+    need_command "$IPTABLES_SAVE"
+    need_command "$IPTABLES_RESTORE"
+    if [[ "$(ipv6_state)" == disabled ]]; then
+        SKIP_IPV6=1
+        warn "IPv6: Disabled by system. IPv6 policy remains stored but will not be applied."
+    else
+        need_command "$IP6TABLES"
+        need_command "$IP6TABLES_SAVE"
+        need_command "$IP6TABLES_RESTORE"
+    fi
+    ssh_lockout_check || die "Apply cancelled to protect the current SSH session."
+    generate_rules
+}
+
+apply_cmd() {
+    while (($#)); do
+        case "$1" in
+            --dry-run) DRY_RUN=1 ;;
+            --non-interactive) NON_INTERACTIVE=1 ;;
+            --preserve-current-ssh) PRESERVE_CURRENT_SSH=1 ;;
+            *) die "Unknown apply option: $1" ;;
+        esac
+        shift
+    done
+    [[ -f "$CONFIG_FILE" ]] || { info "No configuration exists; nothing to apply."; return 0; }
+    if [[ "$(jq -r '.rules | length' "$CONFIG_FILE" 2>/dev/null || printf invalid)" == 0 ]]; then
+        info "Configuration has no protected ports; nothing to apply."
+        return 0
+    fi
+    preflight_apply
+    if (( DRY_RUN )); then
+        print_dry_run_family 4 "$IPTABLES" RULES_V4
+        print_dry_run_family 6 "$IP6TABLES" RULES_V6
+        log_event apply-dry-run success
+        return 0
+    fi
+    acquire_lock
+    TRANSACTION_BACKUP="$(create_backup)"
+    TRANSACTION_ACTIVE=1
+    if ! stage_family "$IPTABLES" RULES_V4 4; then
+        rollback_transaction ipv4-stage-failure
+        die "IPv4 candidate failed; both families were rolled back."
+    fi
+    if (( ! SKIP_IPV6 )); then
+        if ! stage_family "$IP6TABLES" RULES_V6 6; then
+            rollback_transaction ipv6-stage-failure
+            die "IPv6 candidate failed; both families were rolled back."
+        fi
+    fi
+    if ! switch_family "$IPTABLES" 4; then
+        rollback_transaction ipv4-switch-failure
+        die "IPv4 switch failed; both families were rolled back."
+    fi
+    if (( ! SKIP_IPV6 )); then
+        if ! switch_family "$IP6TABLES" 6; then
+            rollback_transaction ipv6-switch-failure
+            die "IPv6 switch failed; both families were rolled back."
+        fi
+    fi
+    TRANSACTION_ACTIVE=0
+    log_event apply success "backup=${TRANSACTION_BACKUP} ipv6_skipped=${SKIP_IPV6}"
+    info "Configuration applied successfully. Backup: ${TRANSACTION_BACKUP}"
+}
+
+backup_cmd() {
+    require_root; acquire_lock
+    need_command "$IPTABLES_SAVE"; need_command "$IP6TABLES_SAVE"
+    local stamp
+    stamp="$(create_backup)"
+    info "Backup created: $stamp"
+}
+
+list_backups() {
+    local file
+    shopt -s nullglob
+    for file in "$BACKUP_DIR"/*.ipv4.rules; do
+        [[ -f "${file%.ipv4.rules}.ipv6.rules" ]] && basename "${file%.ipv4.rules}"
+    done | sort -r
+    shopt -u nullglob
+}
+
+restore_cmd() {
+    require_root; acquire_lock
+    need_command "$IPTABLES_RESTORE"; need_command "$IP6TABLES_RESTORE"
+    local stamp="${1:-}"
+    if [[ -z "$stamp" ]]; then
+        list_backups
+        [[ "$NON_INTERACTIVE" == 0 ]] || die "A backup timestamp is required in non-interactive mode."
+        read -r -p 'Backup timestamp to restore: ' stamp
+    fi
+    [[ "$stamp" =~ ^[0-9]{8}-[0-9]{6}(-[0-9]+)?$ ]] || die "Invalid backup timestamp."
+    local safety
+    safety="$(create_backup "$(date -u '+%Y%m%d-%H%M%S')-pre-restore")"
+    TRANSACTION_BACKUP="$safety"; TRANSACTION_ACTIVE=1
+    if restore_backup_set "$stamp"; then
+        TRANSACTION_ACTIVE=0
+        log_event restore success "set=${stamp} safety=${safety}"
+        info "Restored IPv4 and IPv6 backup set: $stamp"
+    else
+        rollback_transaction restore-failure
+        die "Restore failed; the pre-restore firewall was reinstated."
+    fi
+}
+
+remove_family_rules() {
+    local bin="$1"
+    command -v "$bin" >/dev/null 2>&1 || return 0
+    local managed
+    for managed in "$CHAIN" "$STAGE_CHAIN" "$OLD_CHAIN"; do
+        while "$bin" -w 5 -C INPUT -j "$managed" >/dev/null 2>&1; do "$bin" -w 5 -D INPUT -j "$managed"; done
+    done
+    cleanup_staging "$bin"
+    if family_chain_exists "$bin" "$CHAIN"; then "$bin" -w 5 -F "$CHAIN"; "$bin" -w 5 -X "$CHAIN"; fi
+}
+
+reset_cmd() {
+    require_root
+    if [[ "$NON_INTERACTIVE" == 0 ]]; then
+        local answer
+        read -r -p 'Type RESET PORTSENTINEL to remove only PortSentinel firewall rules: ' answer
+        [[ "$answer" == 'RESET PORTSENTINEL' ]] || { info "Reset cancelled."; return 0; }
+    fi
+    acquire_lock
+    remove_family_rules "$IPTABLES"
+    remove_family_rules "$IP6TABLES"
+    log_event reset success
+    info "PortSentinel INPUT jumps and private chains removed. Configuration was kept."
+}
+
+status_cmd() {
+    local v4_status=Unavailable v6_status=Unavailable v4_backend='not found' v6_backend='not found'
+    if command -v "$IPTABLES" >/dev/null 2>&1; then
+        v4_backend="$($IPTABLES --version 2>/dev/null || true)"
+        family_chain_exists "$IPTABLES" "$CHAIN" && v4_status=Active || v4_status=Inactive
+    fi
+    if [[ "$(ipv6_state)" == disabled ]]; then
+        v6_status='Disabled by system'
+    elif command -v "$IP6TABLES" >/dev/null 2>&1; then
+        v6_backend="$($IP6TABLES --version 2>/dev/null || true)"
+        family_chain_exists "$IP6TABLES" "$CHAIN" && v6_status=Active || v6_status=Inactive
+    fi
+    printf 'PortSentinel %s\n' "$VERSION"
+    printf 'IPv4 Backend : %s\nIPv4 Status  : %s\n' "$v4_backend" "$v4_status"
+    printf 'IPv6 Backend : %s\nIPv6 Status  : %s\n' "$v6_backend" "$v6_status"
+    if [[ -f "$CONFIG_FILE" ]] && validate_config >/dev/null 2>&1; then
+        printf 'Protected Ports: %s\nIP Groups      : %s\n' "$(jq '.rules|length' "$CONFIG_FILE")" "$(jq '.groups|length' "$CONFIG_FILE")"
+    else
+        printf 'Configuration: missing or invalid\n'
+    fi
+}
+
+list_rules() {
+    ensure_config
+    printf '%-3s %-24s %-8s %-12s %-12s %-12s\n' ID NAME PROTO PORT IPv4 IPv6
+    jq -r '.rules | to_entries[] | [(.key+1), .value.name, (.value.protocol|ascii_upcase), .value.port,
+      ((.value.groups|join(",")) // ""), ((.value.groups|join(",")) // "")] | @tsv' "$CONFIG_FILE" |
+    while IFS=$'\t' read -r id name proto port group4 group6; do
+        [[ -n "$group4" ]] || group4="custom/$(jq -r --argjson i "$((id-1))" '.rules[$i].ipv4_default|ascii_upcase' "$CONFIG_FILE")"
+        [[ -n "$group6" ]] || group6="custom/$(jq -r --argjson i "$((id-1))" '.rules[$i].ipv6_default|ascii_upcase' "$CONFIG_FILE")"
+        printf '%-3s %-24.24s %-8s %-12s %-12.12s %-12.12s\n' "$id" "$name" "$proto" "$port" "$group4" "$group6"
+    done
+}
+
+list_groups() {
+    ensure_config
+    jq -r '.groups | to_entries[] | "\(.key)\n  IPv4: \(.value.ipv4|join(", ") // "")\n  IPv6: \(.value.ipv6|join(", ") // "")"' "$CONFIG_FILE"
+}
+
+effective_rules_cmd() {
+    ensure_config; validate_config || die "Invalid configuration."
+    local count index name proto port family default source
+    count="$(jq '.rules|length' "$CONFIG_FILE")"
+    for ((index=0; index<count; index++)); do
+        name="$(jq -r --argjson i "$index" '.rules[$i].name' "$CONFIG_FILE")"
+        proto="$(jq -r --argjson i "$index" '.rules[$i].protocol|ascii_upcase' "$CONFIG_FILE")"
+        port="$(jq -r --argjson i "$index" '.rules[$i].port' "$CONFIG_FILE")"
+        printf '\nRule: %s\n%s/%s\n' "$name" "$proto" "$port"
+        for family in 4 6; do
+            default="$(jq -r --argjson i "$index" --arg key "ipv${family}_default" '.rules[$i][$key]|ascii_upcase' "$CONFIG_FILE")"
+            printf '\nIPv%s:\nALLOW\n' "$family"
+            while IFS= read -r source; do printf '  %s\n' "$source"; done < <(collect_sources "$index" "$family")
+            printf 'DEFAULT\n  %s\n' "$default"
+        done
+    done
+    if [[ "${EUID}" -eq 0 ]]; then
+        printf '\n===== IPv4 counters =====\n'; "$IPTABLES" -w 5 -L "$CHAIN" -n -v --line-numbers 2>/dev/null || printf 'Chain is not active.\n'
+        printf '\n===== IPv6 counters =====\n'; "$IP6TABLES" -w 5 -L "$CHAIN" -n -v --line-numbers 2>/dev/null || printf 'Chain is not active.\n'
+    fi
+}
+
+add_group() {
+    local name
+    read -r -p 'Group name: ' name
+    [[ "$name" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$ ]] || die "Invalid group name."
+    jq -e --arg name "$name" '.groups|has($name)|not' "$CONFIG_FILE" >/dev/null || die "Group already exists."
+    config_edit group-add --arg name "$name" '.groups[$name]={ipv4:[],ipv6:[]}'
+}
+
+add_group_address() {
+    local name family address key
+    read -r -p 'Group name: ' name
+    jq -e --arg name "$name" '.groups|has($name)' "$CONFIG_FILE" >/dev/null || die "Unknown group."
+    read -r -p 'Address family (4/6): ' family
+    [[ "$family" == 4 || "$family" == 6 ]] || die "Family must be 4 or 6."
+    read -r -p 'IP address or CIDR: ' address
+    validate_address "$address" "$family" || die "Invalid IPv${family} address or CIDR."
+    key="ipv${family}"
+    config_edit group-address-add --arg name "$name" --arg key "$key" --arg address "$address" \
+      '.groups[$name][$key] = ((.groups[$name][$key] + [$address]) | unique)'
+}
+
+remove_group_address() {
+    local name family address key
+    read -r -p 'Group name: ' name; read -r -p 'Address family (4/6): ' family; read -r -p 'Exact address/CIDR to remove: ' address
+    [[ "$family" == 4 || "$family" == 6 ]] || die "Family must be 4 or 6."
+    key="ipv${family}"
+    config_edit group-address-remove --arg name "$name" --arg key "$key" --arg address "$address" \
+      '.groups[$name][$key] |= map(select(. != $address))'
+}
+
+rename_group() {
+    local old new
+    read -r -p 'Current group name: ' old; read -r -p 'New group name: ' new
+    [[ "$new" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$ ]] || die "Invalid group name."
+    jq -e --arg old "$old" --arg new "$new" '.groups|has($old) and (has($new)|not)' "$CONFIG_FILE" >/dev/null || die "Source missing or destination exists."
+    config_edit group-rename --arg old "$old" --arg new "$new" \
+      '.groups[$new]=.groups[$old] | del(.groups[$old]) | .rules |= map(.groups |= map(if . == $old then $new else . end))'
+}
+
+delete_group() {
+    local name refs answer
+    read -r -p 'Group name: ' name
+    refs="$(jq -r --arg name "$name" '[.rules[]|select(.groups|index($name))]|length' "$CONFIG_FILE")"
+    if (( refs > 0 )); then
+        warn "Group is referenced by ${refs} rule(s)."
+        read -r -p 'Type DELETE REFERENCED GROUP to detach and delete: ' answer
+        [[ "$answer" == 'DELETE REFERENCED GROUP' ]] || { info "Delete cancelled."; return; }
+    fi
+    config_edit group-delete --arg name "$name" 'del(.groups[$name]) | .rules |= map(.groups -= [$name])'
+}
+
+groups_menu() {
+    while true; do
+        printf '\nIP Groups\n[1] List\n[2] Create\n[3] Rename\n[4] Delete\n[5] Add address/CIDR\n[6] Remove address/CIDR\n[0] Back\n'
+        local choice; read -r -p '> ' choice
+        case "$choice" in 1) list_groups;; 2) add_group;; 3) rename_group;; 4) delete_group;; 5) add_group_address;; 6) remove_group_address;; 0) return;; *) warn "Invalid choice.";; esac
+    done
+}
+
+access_prompt() {
+    local family="$1" default_var="$2" sources_var="$3"
+    local choice value="" default=drop sources='[]'
+    printf 'IPv%s direct access: [1] Custom addresses [2] Block all [3] Leave unrestricted\n' "$family"
+    read -r -p '> ' choice
+    case "$choice" in
+        1)
+            read -r -p 'Addresses/CIDRs (comma-separated): ' value
+            local item
+            IFS=',' read -r -a items <<<"$value"
+            for item in "${items[@]}"; do validate_address "$item" "$family" || die "Invalid IPv${family}: $item"; done
+            sources="$(printf '%s\n' "${items[@]}" | jq -R . | jq -s 'unique')"
+            ;;
+        2|'') default=drop ;;
+        3) default=accept ;;
+        *) die "Invalid access choice." ;;
+    esac
+    printf -v "$default_var" '%s' "$default"
+    printf -v "$sources_var" '%s' "$sources"
+}
+
+add_rule() {
+    local name port proto_choice protocol v4_default v6_default groups_text v4_sources v6_sources
+    read -r -p 'Rule name: ' name; [[ -n "$name" ]] || die "Rule name is required."
+    read -r -p 'Port or range (for example 10773 or 20000:20100): ' port; validate_port "$port" || die "Invalid port."
+    printf 'Protocol: [1] TCP [2] UDP [3] TCP + UDP\n'; read -r -p '> ' proto_choice
+    case "$proto_choice" in 1) protocol=tcp;; 2) protocol=udp;; 3) protocol=both;; *) die "Invalid protocol.";; esac
+    printf 'Attached IP groups contribute both their IPv4 and IPv6 members.\n'
+    read -r -p 'Group names (comma-separated, blank for none): ' groups_text
+    local group_json
+    group_json="$(printf '%s' "$groups_text" | tr ',' '\n' | sed '/^$/d' | jq -R . | jq -s 'unique')"
+    local group
+    while IFS= read -r group; do jq -e --arg group "$group" '.groups|has($group)' "$CONFIG_FILE" >/dev/null || die "Unknown group: $group"; done < <(jq -r '.[]' <<<"$group_json")
+    access_prompt 4 v4_default v4_sources
+    access_prompt 6 v6_default v6_sources
+    config_edit rule-add --arg name "$name" --arg protocol "$protocol" --arg port "$port" \
+      --argjson groups "$group_json" --argjson v4 "$v4_sources" --argjson v6 "$v6_sources" \
+      --arg d4 "$v4_default" --arg d6 "$v6_default" \
+      '.rules += [{name:$name,protocol:$protocol,port:$port,groups:$groups,sources:{ipv4:$v4,ipv6:$v6},ipv4_default:$d4,ipv6_default:$d6}]'
+}
+
+read_rule_index() {
+    local index_var="$1" selected_id count
+    list_rules
+    read -r -p 'Rule ID: ' selected_id
+    [[ "$selected_id" =~ ^[0-9]+$ ]] || die "Invalid rule ID."
+    count="$(jq '.rules|length' "$CONFIG_FILE")"
+    (( selected_id >= 1 && selected_id <= count )) || die "Rule ID out of range."
+    printf -v "$index_var" '%s' "$((selected_id-1))"
+}
+
+edit_rule() {
+    local index field value
+    read_rule_index index
+    printf '[1] Name [2] Port [3] Protocol [4] IPv4 default [5] IPv6 default\n'
+    read -r -p '> ' field
+    case "$field" in
+        1)
+            read -r -p 'New name: ' value; [[ -n "$value" ]] || die "Name is required."
+            config_edit rule-edit --argjson i "$index" --arg value "$value" '.rules[$i].name=$value'
+            ;;
+        2)
+            read -r -p 'New port/range: ' value; validate_port "$value" || die "Invalid port."
+            config_edit rule-edit --argjson i "$index" --arg value "$value" '.rules[$i].port=$value'
+            ;;
+        3)
+            read -r -p 'Protocol (tcp/udp/both): ' value; [[ "$value" == tcp || "$value" == udp || "$value" == both ]] || die "Invalid protocol."
+            config_edit rule-edit --argjson i "$index" --arg value "$value" '.rules[$i].protocol=$value'
+            ;;
+        4|5)
+            read -r -p 'Default (drop/accept): ' value; [[ "$value" == drop || "$value" == accept ]] || die "Invalid default."
+            local key; [[ "$field" == 4 ]] && key=ipv4_default || key=ipv6_default
+            config_edit rule-edit --argjson i "$index" --arg key "$key" --arg value "$value" '.rules[$i][$key]=$value'
+            ;;
+        *) die "Invalid edit choice." ;;
+    esac
+}
+
+add_rule_source() {
+    local index family address key
+    read_rule_index index
+    read -r -p 'Address family (4/6): ' family; [[ "$family" == 4 || "$family" == 6 ]] || die "Family must be 4 or 6."
+    read -r -p 'Address or CIDR: ' address; validate_address "$address" "$family" || die "Invalid address."
+    key="ipv${family}"
+    config_edit rule-source-add --argjson i "$index" --arg key "$key" --arg address "$address" \
+      '.rules[$i].sources[$key] = ((.rules[$i].sources[$key] + [$address]) | unique)'
+}
+
+remove_rule_source() {
+    local index family address key
+    read_rule_index index
+    read -r -p 'Address family (4/6): ' family; [[ "$family" == 4 || "$family" == 6 ]] || die "Family must be 4 or 6."
+    read -r -p 'Exact address or CIDR: ' address; key="ipv${family}"
+    config_edit rule-source-remove --argjson i "$index" --arg key "$key" --arg address "$address" \
+      '.rules[$i].sources[$key] |= map(select(. != $address))'
+}
+
+attach_rule_group() {
+    local index group
+    read_rule_index index; read -r -p 'Group name: ' group
+    jq -e --arg group "$group" '.groups|has($group)' "$CONFIG_FILE" >/dev/null || die "Unknown group."
+    config_edit rule-group-attach --argjson i "$index" --arg group "$group" '.rules[$i].groups = ((.rules[$i].groups + [$group]) | unique)'
+}
+
+detach_rule_group() {
+    local index group
+    read_rule_index index; read -r -p 'Group name: ' group
+    config_edit rule-group-detach --argjson i "$index" --arg group "$group" '.rules[$i].groups -= [$group]'
+}
+
+delete_rule() {
+    list_rules
+    local id answer count
+    read -r -p 'Rule ID to delete: ' id; [[ "$id" =~ ^[0-9]+$ ]] || die "Invalid ID."
+    count="$(jq '.rules|length' "$CONFIG_FILE")"; (( id >= 1 && id <= count )) || die "Rule ID out of range."
+    read -r -p 'Type DELETE RULE to confirm: ' answer; [[ "$answer" == 'DELETE RULE' ]] || { info "Delete cancelled."; return; }
+    config_edit rule-delete --argjson i "$((id-1))" 'del(.rules[$i])'
+}
+
+protected_ports_menu() {
+    while true; do
+        printf '\nProtected Ports\n[1] List / View\n[2] Add\n[3] Edit\n[4] Delete\n[5] Add source\n[6] Remove source\n[7] Attach group\n[8] Detach group\n[0] Back\n'
+        local choice; read -r -p '> ' choice
+        case "$choice" in
+            1) list_rules;; 2) add_rule;; 3) edit_rule;; 4) delete_rule;; 5) add_rule_source;; 6) remove_rule_source;;
+            7) attach_rule_group;; 8) detach_rule_group;; 0) return;; *) warn "Invalid choice.";;
+        esac
+    done
+}
+
+update_cmd() {
+    require_root
+    need_command curl
+    local temp
+    temp="$(mktemp /tmp/portsentinel-install.XXXXXX)"
+    trap 'rm -f -- "$temp"' RETURN
+    info "Downloading the repository installer from ${UPDATE_INSTALLER_URL}"
+    curl -fsSL --proto '=https' --tlsv1.2 "$UPDATE_INSTALLER_URL" -o "$temp"
+    bash -n "$temp" || die "Downloaded installer failed syntax validation."
+    grep -q 'PortSentinel installer' "$temp" || die "Downloaded file is not a PortSentinel installer."
+    bash "$temp" --update
+    rm -f -- "$temp"
+    trap - RETURN
+    log_event update success
+}
+
+uninstall_cmd() {
+    require_root
+    local helper=/usr/local/lib/portsentinel/uninstall.sh
+    if [[ -x "$helper" ]]; then exec "$helper"; fi
+    die "Uninstall helper not found. Re-run install.sh, then use portsentinel uninstall."
+}
+
+tui() {
+    ensure_config
+    while true; do
+        clear 2>/dev/null || true
+        printf '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n PortSentinel\n Dual-Stack Port Whitelist Manager\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n'
+        printf ' IPv4 Backend      : %s\n' "$(command -v "$IPTABLES" >/dev/null 2>&1 && printf iptables || printf Unavailable)"
+        printf ' IPv6 Backend      : %s\n' "$(command -v "$IP6TABLES" >/dev/null 2>&1 && printf ip6tables || printf Unavailable)"
+        printf ' IPv4              : Enabled\n IPv6              : %s\n' "$(ipv6_state | sed 's/^./\U&/')"
+        printf ' Protected Ports   : %s\n IP Groups         : %s\n\n' "$(jq '.rules|length' "$CONFIG_FILE")" "$(jq '.groups|length' "$CONFIG_FILE")"
+        printf ' [1] Protected Ports\n [2] IP Groups\n [3] Add Rule\n [4] Delete Rule\n [5] Show Effective Rules\n [6] Apply Configuration\n [7] Backup / Restore\n [8] Firewall Status\n [9] Reset PortSentinel Rules\n\n [u] Update\n [0] Exit\n\n'
+        local choice; read -r -p '> ' choice
+        case "$choice" in
+            1) protected_ports_menu;; 2) groups_menu;; 3) add_rule;; 4) delete_rule;;
+            5) effective_rules_cmd;; 6) apply_cmd;;
+            7) printf '[1] Backup [2] Restore\n'; read -r -p '> ' choice; [[ "$choice" == 1 ]] && backup_cmd || restore_cmd;;
+            8) status_cmd;; 9) reset_cmd;; u|U) update_cmd;; 0) return;; *) warn "Invalid choice.";;
+        esac
+        read -r -p 'Press Enter to continue...' _ || true
+    done
+}
+
+usage() {
+    cat <<'EOF'
+Usage: portsentinel [command]
+
+Commands:
+  status                         Show backend and policy status
+  list | rule list               List protected-port rules
+  group list                     List reusable IP groups
+  effective                     Show expanded policy and counters
+  apply [--dry-run] [--non-interactive]
+                                 Validate and transactionally apply both families
+  backup                         Save paired IPv4/IPv6 firewall backup
+  restore [TIMESTAMP]            Restore a paired backup set
+  reset [--non-interactive]      Remove only PortSentinel firewall rules
+  update                         Download, validate, and run the latest installer
+  uninstall                      Remove PortSentinel safely
+  version                        Print the version
+  help                           Show this help
+
+Run without a command for the interactive menu.
+EOF
+}
+
+main() {
+    require_base_dependencies
+    local command="${1:-}"
+    [[ $# -eq 0 ]] || shift
+    case "$command" in
+        '') tui;;
+        status) status_cmd "$@";;
+        list) list_rules "$@";;
+        rule) [[ "${1:-}" == list ]] || die "Usage: portsentinel rule list"; list_rules;;
+        group) [[ "${1:-}" == list ]] || die "Usage: portsentinel group list"; list_groups;;
+        effective) effective_rules_cmd;;
+        apply) apply_cmd "$@";;
+        backup) backup_cmd "$@";;
+        restore) restore_cmd "$@";;
+        reset) [[ "${1:-}" == --non-interactive ]] && NON_INTERACTIVE=1; reset_cmd;;
+        update) update_cmd;;
+        uninstall) uninstall_cmd;;
+        version|--version|-V) printf 'PortSentinel %s\n' "$VERSION";;
+        help|--help|-h) usage;;
+        *) usage >&2; die "Unknown command: $command";;
+    esac
+}
+
+if [[ "${PORTSENTINEL_LIB_ONLY:-0}" != 1 ]]; then main "$@"; fi
