@@ -14,6 +14,7 @@ tests=(
   test-ipv6-empty-whitelist.sh
   test-chinese-tui.sh
   test-add-rule-flow.sh
+  test-tui-input-retry.sh
   test-ssh-protection.sh
   test-dry-run.sh
   test-apply-idempotent.sh
