@@ -3,7 +3,7 @@
 set -Eeuo pipefail
 umask 077
 
-readonly VERSION="1.1.1"
+readonly VERSION="1.2.0"
 readonly CHAIN="PORTSENTINEL"
 readonly STAGE_CHAIN="PORTSENTINEL_NEW"
 readonly OLD_CHAIN="PORTSENTINEL_OLD"
@@ -46,6 +46,29 @@ declare -a RULES_V6=()
 color() {
     if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then printf '\033[%sm' "$1"; fi
 }
+
+ui_header() {
+    printf '%s╭━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╮%s\n' "$(color '1;36')" "$(color 0)"
+    printf '  %sPortSentinel%s  %sv%s\n' "$(color '1;37')" "$(color 0)" "$(color '2')" "$VERSION"
+    printf '  %sLinux 双栈端口白名单管理工具%s\n' "$(color '2')" "$(color 0)"
+    printf '%s╰━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╯%s\n' "$(color '1;36')" "$(color 0)"
+}
+
+ui_section() {
+    printf '\n%s◆ %s%s\n' "$(color '1;36')" "$1" "$(color 0)"
+    printf '%s────────────────────────────────────────────────────%s\n' "$(color '2')" "$(color 0)"
+}
+
+ui_menu_item() {
+    printf '  %s[%s]%s %s%s%s\n' "$(color '1;36')" "$1" "$(color 0)" "$(color '1')" "$2" "$(color 0)"
+    [[ -z "${3:-}" ]] || printf '      %s%s%s\n' "$(color '2')" "$3" "$(color 0)"
+}
+
+ui_status() {
+    printf '  %s●%s %s：%s%s%s\n' "$(color "$3")" "$(color 0)" "$1" "$(color "$3")" "$2" "$(color 0)"
+}
+
+ui_prompt() { printf '%s请选择操作 › %s' "$(color '1;36')" "$(color 0)"; }
 
 info() { printf '%s[信息]%s %s\n' "$(color '1;34')" "$(color 0)" "$*"; }
 warn() { printf '%s[警告]%s %s\n' "$(color '1;33')" "$(color 0)" "$*" >&2; }
@@ -697,7 +720,15 @@ list_rules() {
 
 list_groups() {
     ensure_config
-    jq -r '.groups | to_entries[] | "\(.key)\n  IPv4: \(.value.ipv4|join(", ") // "")\n  IPv6: \(.value.ipv6|join(", ") // "")"' "$CONFIG_FILE"
+    if ! jq -e '.groups | length > 0' "$CONFIG_FILE" >/dev/null; then
+        info "暂无 IP Group。"
+        return
+    fi
+    printf 'IP Group 列表：\n'
+    jq -r '.groups | to_entries[] |
+      "\n[\(.key)]\n" +
+      "  IPv4（\(.value.ipv4|length)）：\(if (.value.ipv4|length) == 0 then "无" else (.value.ipv4|join(", ")) end)\n" +
+      "  IPv6（\(.value.ipv6|length)）：\(if (.value.ipv6|length) == 0 then "无" else (.value.ipv6|join(", ")) end)"' "$CONFIG_FILE"
 }
 
 effective_rules_cmd() {
@@ -730,15 +761,33 @@ add_group() {
     config_edit group-add --arg name "$name" '.groups[$name]={ipv4:[],ipv6:[]}'
 }
 
+prompt_existing_group() {
+    local output_var="$1" selected_group
+    if ! jq -e '.groups | length > 0' "$CONFIG_FILE" >/dev/null; then
+        warn "尚未创建 IP Group，请先创建。"
+        return 1
+    fi
+    printf '可用 IP Group：\n'
+    jq -r '.groups | keys[] | "  - \(.)"' "$CONFIG_FILE"
+    while true; do
+        read -r -p '请输入 IP Group 名称：' selected_group || return 1
+        if jq -e --arg name "$selected_group" '.groups | has($name)' "$CONFIG_FILE" >/dev/null; then
+            printf -v "$output_var" '%s' "$selected_group"
+            return
+        fi
+        warn "找不到 IP Group：${selected_group}，请重新输入。"
+    done
+}
+
 add_group_address() {
-    local name family address key
-    read -r -p '请输入 IP Group 名称：' name
-    jq -e --arg name "$name" '.groups|has($name)' "$CONFIG_FILE" >/dev/null || die "找不到该 IP Group。"
-    prompt_address_family family || return 1
-    prompt_valid_address "$family" address '请输入 IP 地址或 CIDR：' || return 1
-    key="ipv${family}"
-    config_edit group-address-add --arg name "$name" --arg key "$key" --arg address "$address" \
-      '.groups[$name][$key] = ((.groups[$name][$key] + [$address]) | unique)'
+    local name v4_addresses='[]' v6_addresses='[]'
+    prompt_existing_group name || return 1
+    prompt_mixed_addresses v4_addresses v6_addresses \
+      '请输入要添加的 IP/CIDR（多个用逗号分隔，可混合 IPv4 和 IPv6）：' || return 1
+    config_edit group-address-add --arg name "$name" --argjson v4 "$v4_addresses" --argjson v6 "$v6_addresses" \
+      '.groups[$name].ipv4 = ((.groups[$name].ipv4 + $v4) | unique) |
+       .groups[$name].ipv6 = ((.groups[$name].ipv6 + $v6) | unique)'
+    info "已批量更新 IP Group：${name}。请返回主菜单选择 [6] 应用配置。"
 }
 
 remove_group_address() {
@@ -781,8 +830,16 @@ run_tui_action() {
 
 groups_menu() {
     while true; do
-        printf '\nIP Group 管理\n[1] 查看列表\n[2] 创建 Group\n[3] 重命名 Group\n[4] 删除 Group\n[5] 添加地址/CIDR\n[6] 删除地址/CIDR\n[0] 返回\n'
-        local choice; read -r -p '> ' choice
+        ui_section "IP Group 管理"
+        ui_menu_item 1 "查看 Group 列表" "查看每个 Group 中的 IPv4/IPv6 地址"
+        ui_menu_item 2 "创建 Group" "创建可被多个端口复用的白名单"
+        ui_menu_item 3 "重命名 Group" "保留已有地址和规则绑定"
+        ui_menu_item 4 "删除 Group" "被规则引用时需要额外确认"
+        ui_menu_item 5 "批量添加 IP/CIDR" "用逗号分隔，可混合 IPv4 和 IPv6"
+        ui_menu_item 6 "删除单个 IP/CIDR" "从指定 Group 中移除一个地址"
+        ui_menu_item 0 "返回主菜单"
+        printf '\n'; ui_prompt
+        local choice; read -r choice
         case "$choice" in
             1) list_groups ;;
             2) run_tui_action add_group ;;
@@ -827,11 +884,12 @@ prompt_valid_address() {
     done
 }
 
-prompt_direct_sources() {
-    local v4_var="$1" v6_var="$2" source_text raw item invalid
+prompt_mixed_addresses() {
+    local v4_var="$1" v6_var="$2" prompt_text="${3:-请输入允许访问的 IP/CIDR（多个用逗号分隔，可混合 IPv4 和 IPv6）：}"
+    local source_text raw item invalid
     local -a source_items=() v4_items=() v6_items=()
     while true; do
-        read -r -p '请输入允许访问的 IP/CIDR（多个用逗号分隔，可混合 IPv4 和 IPv6）：' source_text || return 1
+        read -r -p "$prompt_text" source_text || return 1
         source_items=(); v4_items=(); v6_items=(); invalid=""
         if [[ -z "$source_text" ]]; then
             warn "IP/CIDR 不能为空，请重新输入。"
@@ -921,7 +979,7 @@ add_rule() {
         printf '请选择白名单来源：\n[1] 直接输入 IP/CIDR\n[2] 绑定 IP Group\n[3] 暂不添加来源（阻止所有访问）\n'
         read -r -p '> ' source_choice || return 1
         case "$source_choice" in
-            1) prompt_direct_sources v4_sources v6_sources && break ;;
+            1) prompt_mixed_addresses v4_sources v6_sources && break ;;
             2) prompt_rule_groups group_json && break ;;
             3) break ;;
             *) warn "白名单来源选项无效，请重新选择。" ;;
@@ -1022,8 +1080,18 @@ delete_rule() {
 
 protected_ports_menu() {
     while true; do
-        printf '\n受保护端口管理\n[1] 查看列表/详情\n[2] 添加端口保护\n[3] 编辑规则\n[4] 删除规则\n[5] 添加来源\n[6] 删除来源\n[7] 绑定 IP Group\n[8] 解绑 IP Group\n[0] 返回\n'
-        local choice; read -r -p '> ' choice
+        ui_section "受保护端口管理"
+        ui_menu_item 1 "查看规则详情" "查看协议、端口、来源和默认策略"
+        ui_menu_item 2 "添加端口保护" "选择 TCP/UDP，并设置直接 IP 或 Group"
+        ui_menu_item 3 "编辑规则" "修改名称、端口、协议或默认策略"
+        ui_menu_item 4 "删除规则" "删除一条受保护端口规则"
+        ui_menu_item 5 "添加直接来源" "给已有规则添加一个 IP/CIDR"
+        ui_menu_item 6 "删除直接来源" "从已有规则移除一个 IP/CIDR"
+        ui_menu_item 7 "绑定 IP Group" "复用 Group 中的 IPv4/IPv6 白名单"
+        ui_menu_item 8 "解绑 IP Group" "停止引用指定 Group"
+        ui_menu_item 0 "返回主菜单"
+        printf '\n'; ui_prompt
+        local choice; read -r choice
         case "$choice" in
             1) list_rules ;;
             2) run_tui_action add_rule ;;
@@ -1066,13 +1134,43 @@ tui() {
     ensure_config
     while true; do
         clear 2>/dev/null || true
-        printf '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n PortSentinel\n Linux 双栈端口白名单管理工具\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n'
-        printf ' IPv4 后端       ：%s\n' "$(command -v "$IPTABLES" >/dev/null 2>&1 && printf iptables || printf 不可用)"
-        printf ' IPv6 后端       ：%s\n' "$(command -v "$IP6TABLES" >/dev/null 2>&1 && printf ip6tables || printf 不可用)"
-        printf ' IPv4 状态       ：已启用\n IPv6 状态       ：%s\n' "$(ipv6_state | sed 's/enabled/已启用/; s/disabled/已被系统禁用/')"
-        printf ' 受保护端口数量 ：%s\n IP Group 数量   ：%s\n\n' "$(jq '.rules|length' "$CONFIG_FILE")" "$(jq '.groups|length' "$CONFIG_FILE")"
-        printf ' [1] 受保护端口\n [2] IP Group 管理\n [3] 添加端口保护\n [4] 删除规则\n [5] 查看有效规则\n [6] 应用配置\n [7] 备份 / 恢复\n [8] 防火墙状态\n [9] 重置 PortSentinel 规则\n\n [u] 一键更新\n [0] 退出\n\n'
-        local choice; read -r -p '> ' choice
+        local backend4 backend6 status4 status6 state6 color4 color6 choice
+        backend4="$(command -v "$IPTABLES" >/dev/null 2>&1 && printf iptables || printf 不可用)"
+        backend6="$(command -v "$IP6TABLES" >/dev/null 2>&1 && printf ip6tables || printf 不可用)"
+        state6="$(ipv6_state | sed 's/enabled/已启用/; s/disabled/已被系统禁用/')"
+        if [[ "$backend4" == "不可用" ]]; then status4="后端不可用"; color4='1;31'; else status4="${backend4} · 已启用"; color4='1;32'; fi
+        if [[ "$backend6" == "不可用" ]]; then
+            status6="后端不可用"; color6='1;31'
+        elif [[ "$state6" == "已启用" ]]; then
+            status6="${backend6} · 已启用"; color6='1;32'
+        else
+            status6="${backend6} · ${state6}"; color6='1;33'
+        fi
+
+        ui_header
+        ui_section "系统状态"
+        ui_status "IPv4 防火墙" "$status4" "$color4"
+        ui_status "IPv6 防火墙" "$status6" "$color6"
+        printf '  %s受保护端口%s：%s    %sIP Group%s：%s\n' \
+          "$(color '1')" "$(color 0)" "$(jq '.rules|length' "$CONFIG_FILE")" \
+          "$(color '1')" "$(color 0)" "$(jq '.groups|length' "$CONFIG_FILE")"
+
+        ui_section "操作菜单"
+        ui_menu_item 1 "受保护端口" "查看、编辑以及绑定白名单"
+        ui_menu_item 2 "IP Group 管理" "集中管理可复用的 IP/CIDR"
+        ui_menu_item 3 "添加端口保护" "选择协议并绑定直接 IP 或 Group"
+        ui_menu_item 4 "删除规则" "删除指定的端口保护"
+        ui_menu_item 5 "查看有效规则" "展开 Group 并查看最终白名单"
+        ui_menu_item 6 "应用配置" "验证后写入 IPv4/IPv6 防火墙"
+        ui_menu_item 7 "备份 / 恢复" "管理双栈防火墙快照"
+        ui_menu_item 8 "防火墙状态" "查看后端、链和配置状态"
+        ui_menu_item 9 "重置规则" "仅移除 PortSentinel 私有规则"
+        printf '\n'
+        ui_menu_item u "一键更新" "保留配置并更新到最新版本"
+        ui_menu_item 0 "退出" "安全结束 PortSentinel，不修改当前规则"
+        printf '\n%s提示：修改配置后，请选择 [6] 应用配置。%s\n\n' "$(color '1;33')" "$(color 0)"
+        ui_prompt
+        read -r choice
         case "$choice" in
             1) protected_ports_menu ;;
             2) groups_menu ;;
