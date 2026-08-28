@@ -10,6 +10,7 @@ output="$(printf '0\n' | TERM=dumb PORTSENTINEL_CONFIG_DIR="$root/etc" PORTSENTI
 [[ "$output" == *'Linux 双栈端口白名单管理工具'* ]]
 [[ "$output" == *'[1] 受保护端口'* ]]
 [[ "$output" == *'[2] IP Group 管理'* ]]
+[[ "$output" == *'[3] 添加端口保护'* ]]
 [[ "$output" == *'[6] 应用配置'* ]]
 [[ "$output" == *'[u] 一键更新'* ]]
 [[ "$output" == *'[0] 退出'* ]]
