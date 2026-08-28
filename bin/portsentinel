@@ -47,9 +47,9 @@ color() {
     if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then printf '\033[%sm' "$1"; fi
 }
 
-info() { printf '%s[INFO]%s %s\n' "$(color '1;34')" "$(color 0)" "$*"; }
-warn() { printf '%s[WARN]%s %s\n' "$(color '1;33')" "$(color 0)" "$*" >&2; }
-die() { printf '%s[ERROR]%s %s\n' "$(color '1;31')" "$(color 0)" "$*" >&2; exit 1; }
+info() { printf '%s[信息]%s %s\n' "$(color '1;34')" "$(color 0)" "$*"; }
+warn() { printf '%s[警告]%s %s\n' "$(color '1;33')" "$(color 0)" "$*" >&2; }
+die() { printf '%s[错误]%s %s\n' "$(color '1;31')" "$(color 0)" "$*" >&2; exit 1; }
 
 log_event() {
     local operation="$1" result="$2" detail="${3:-}"
@@ -60,7 +60,7 @@ log_event() {
     fi
 }
 
-need_command() { command -v "$1" >/dev/null 2>&1 || die "Required command not found: $1"; }
+need_command() { command -v "$1" >/dev/null 2>&1 || die "缺少必需命令：$1"; }
 
 require_base_dependencies() {
     need_command bash
@@ -70,7 +70,7 @@ require_base_dependencies() {
 
 require_root() {
     if [[ "${EUID}" -ne 0 && "${PORTSENTINEL_ALLOW_NON_ROOT:-0}" != 1 ]]; then
-        die "This operation must run as root."
+        die "此操作必须使用 root 权限运行。"
     fi
 }
 
@@ -78,7 +78,7 @@ acquire_lock() {
     need_command "$FLOCK_CMD"
     mkdir -p "$(dirname "$LOCK_FILE")"
     exec 9>"$LOCK_FILE"
-    "$FLOCK_CMD" -n 9 || die "Another PortSentinel operation is running."
+    "$FLOCK_CMD" -n 9 || die "另一个 PortSentinel 操作正在运行，请稍后再试。"
 }
 
 default_config() {
@@ -104,7 +104,7 @@ try:
     expected = int(sys.argv[2])
     obj = ipaddress.ip_network(value, strict=False) if "/" in value else ipaddress.ip_address(value)
     if expected and obj.version != expected:
-        raise ValueError("wrong address family")
+        raise ValueError("地址族错误")
 except ValueError as exc:
     print(exc, file=sys.stderr)
     raise SystemExit(1)
@@ -125,7 +125,7 @@ validate_port() {
 
 validate_config() {
     local file="${1:-$CONFIG_FILE}"
-    [[ -r "$file" ]] || { warn "Configuration not readable: $file"; return 1; }
+    [[ -r "$file" ]] || { warn "无法读取配置文件：$file"; return 1; }
     jq -e '
       . as $cfg |
       type == "object" and .version == 1 and
@@ -146,7 +146,7 @@ validate_config() {
         (.ipv4_default == "drop" or .ipv4_default == "accept") and
         (.ipv6_default == "drop" or .ipv6_default == "accept")) and
       all(.rules[].groups[]; . as $g | $cfg.groups | has($g))
-    ' "$file" >/dev/null || { warn "Invalid configuration schema."; return 1; }
+    ' "$file" >/dev/null || { warn "配置文件结构无效。"; return 1; }
 
     python3 - "$file" <<'PY'
 import ipaddress, json, re, sys
@@ -158,48 +158,48 @@ def address(value, family, where):
     try:
         obj = ipaddress.ip_network(value, strict=False) if "/" in value else ipaddress.ip_address(value)
     except ValueError as exc:
-        raise SystemExit(f"Invalid {where} address {value!r}: {exc}")
+        raise SystemExit(f"{where} 中的地址 {value!r} 无效：{exc}")
     if obj.version != family:
-        raise SystemExit(f"Wrong address family in {where}: {value!r}")
+        raise SystemExit(f"{where} 中的地址族错误：{value!r}")
 
 def ports(value):
     match = re.fullmatch(r"([0-9]+)(?::([0-9]+))?", value)
     if not match:
-        raise SystemExit(f"Invalid port: {value!r}")
+        raise SystemExit(f"端口无效：{value!r}")
     start = int(match.group(1)); end = int(match.group(2) or start)
     if not (1 <= start <= end <= 65535):
-        raise SystemExit(f"Invalid port range: {value!r}")
+        raise SystemExit(f"端口范围无效：{value!r}")
     return start, end
 
 for name, group in cfg["groups"].items():
     for family in (4, 6):
         values = group[f"ipv{family}"]
         if len(values) != len(set(values)):
-            raise SystemExit(f"Duplicate address in group {name!r} IPv{family}")
+            raise SystemExit(f"IP Group {name!r} 的 IPv{family} 地址重复")
         for value in values:
-            address(value, family, f"group {name!r} IPv{family}")
+            address(value, family, f"IP Group {name!r} IPv{family}")
 
 seen_names = set()
 coverage = {"tcp": [], "udp": []}
 for rule in cfg["rules"]:
     if rule["name"] in seen_names:
-        raise SystemExit(f"Duplicate rule name: {rule['name']!r}")
+        raise SystemExit(f"规则名称重复：{rule['name']!r}")
     seen_names.add(rule["name"])
     start, end = ports(rule["port"])
     protocols = ("tcp", "udp") if rule["protocol"] == "both" else (rule["protocol"],)
     for proto in protocols:
         for old_start, old_end, old_name in coverage[proto]:
             if max(start, old_start) <= min(end, old_end):
-                raise SystemExit(f"Overlapping {proto.upper()} ports: {rule['name']!r} and {old_name!r}")
+                raise SystemExit(f"{proto.upper()} 端口范围重叠：{rule['name']!r} 与 {old_name!r}")
         coverage[proto].append((start, end, rule["name"]))
     if len(rule["groups"]) != len(set(rule["groups"])):
-        raise SystemExit(f"Duplicate group reference in rule {rule['name']!r}")
+        raise SystemExit(f"规则 {rule['name']!r} 中存在重复的 IP Group 引用")
     for family in (4, 6):
         values = rule["sources"][f"ipv{family}"]
         if len(values) != len(set(values)):
-            raise SystemExit(f"Duplicate source in rule {rule['name']!r} IPv{family}")
+            raise SystemExit(f"规则 {rule['name']!r} 中的 IPv{family} 来源重复")
         for value in values:
-            address(value, family, f"rule {rule['name']!r} IPv{family}")
+            address(value, family, f"规则 {rule['name']!r} IPv{family}")
 PY
 }
 
@@ -295,7 +295,7 @@ print_dry_run_family() {
     printf '%q -w 5 -N %q\n' "$bin" "$STAGE_CHAIN"
     local rule
     for rule in "${rules_ref[@]}"; do printf '%q -w 5 %s\n' "$bin" "$rule"; done
-    printf '# Atomic switch: INPUT jump -> %s, remove old chain, rename staging chain -> %s\n\n' "$STAGE_CHAIN" "$CHAIN"
+    printf '# 原子切换：INPUT jump -> %s，删除旧链，将临时链重命名为 %s\n\n' "$STAGE_CHAIN" "$CHAIN"
 }
 
 ipv6_state() {
@@ -326,7 +326,7 @@ cleanup_staging() {
                 "$bin" -w 5 -E "$STAGE_CHAIN" "$CHAIN" || return 1
                 continue
             else
-                warn "Cannot safely recover referenced chain ${OLD_CHAIN} without ${CHAIN}."
+                warn "缺少 ${CHAIN}，无法安全恢复仍被引用的 ${OLD_CHAIN} 链。"
                 return 1
             fi
         fi
@@ -347,7 +347,7 @@ stage_family() {
         read -r -a args <<<"$rule"
         "$bin" -w 5 "${args[@]}" || return 1
     done
-    info "IPv${family} candidate validated and staged."
+    info "IPv${family} 候选规则已验证并写入临时链。"
 }
 
 switch_family() {
@@ -367,7 +367,7 @@ switch_family() {
         "$bin" -w 5 -X "$CHAIN" || return 1
     fi
     "$bin" -w 5 -E "$STAGE_CHAIN" "$CHAIN" || return 1
-    info "IPv${family} policy applied."
+    info "IPv${family} 策略已应用。"
 }
 
 rotate_backups() {
@@ -401,7 +401,7 @@ create_backup() {
     if command -v "$IP6TABLES_SAVE" >/dev/null 2>&1; then
         "$IP6TABLES_SAVE" >"${v6}.tmp"
     else
-        printf '# IPv6 firewall unavailable when this backup was created\n' >"${v6}.tmp"
+        printf '# 创建此备份时 IPv6 防火墙不可用\n' >"${v6}.tmp"
     fi
     chmod 600 "${v4}.tmp" "${v6}.tmp"
     mv -f "${v4}.tmp" "$v4"
@@ -417,7 +417,7 @@ restore_backup_set() {
     local v4="${BACKUP_DIR}/${stamp}.ipv4.rules" v6="${BACKUP_DIR}/${stamp}.ipv6.rules"
     [[ -r "$v4" && -r "$v6" ]] || return 1
     "$IPTABLES_RESTORE" <"$v4" || return 1
-    if ! grep -q '^# IPv6 firewall unavailable' "$v6"; then
+    if ! grep -Eq '^# (IPv6 firewall unavailable|创建此备份时 IPv6 防火墙不可用)' "$v6"; then
         command -v "$IP6TABLES_RESTORE" >/dev/null 2>&1 || return 1
         "$IP6TABLES_RESTORE" <"$v6" || return 1
     fi
@@ -426,12 +426,12 @@ restore_backup_set() {
 rollback_transaction() {
     local reason="${1:-failure}"
     if [[ "$TRANSACTION_ACTIVE" == 1 && -n "$TRANSACTION_BACKUP" ]]; then
-        warn "Rolling back IPv4 and IPv6 to backup ${TRANSACTION_BACKUP} (${reason})."
+        warn "正在把 IPv4 和 IPv6 回滚到备份 ${TRANSACTION_BACKUP}（${reason}）。"
         if restore_backup_set "$TRANSACTION_BACKUP"; then
             log_event rollback success "set=${TRANSACTION_BACKUP} reason=${reason}"
         else
             log_event rollback failure "set=${TRANSACTION_BACKUP} reason=${reason}"
-            warn "Automatic rollback failed; restore backup ${TRANSACTION_BACKUP} manually."
+            warn "自动回滚失败，请手动恢复备份 ${TRANSACTION_BACKUP}。"
         fi
         TRANSACTION_ACTIVE=0
     fi
@@ -480,36 +480,36 @@ ssh_lockout_check() {
     else
         return 0
     fi
-    [[ -z "${extra:-}" && "$server_port" =~ ^[0-9]+$ ]] || { warn "Unable to parse SSH connection metadata; refusing interactive apply."; return 1; }
+    [[ -z "${extra:-}" && "$server_port" =~ ^[0-9]+$ ]] || { warn "无法解析 SSH 连接信息，已拒绝交互式应用。"; return 1; }
     if validate_address "$source" 4 >/dev/null 2>&1; then family=4
     elif validate_address "$source" 6 >/dev/null 2>&1; then family=6
-    else warn "Invalid SSH source in SSH_CONNECTION: $source"; return 1
+    else warn "SSH 连接中的来源地址无效：$source"; return 1
     fi
     if command -v "$SS_CMD" >/dev/null 2>&1; then
         if "$SS_CMD" -lntpH 2>/dev/null | awk -v suffix=":${server_port}" '$4 ~ (suffix "$") {found=1} END {exit !found}'; then
-            info "Verified active SSH listener on TCP/${server_port} with ss -lntp."
+            info "已通过 ss -lntp 确认 TCP/${server_port} 上存在 SSH 监听。"
         else
-            warn "ss -lntp did not expose TCP/${server_port}; using authenticated SSH session metadata."
+            warn "ss -lntp 未显示 TCP/${server_port}，将使用当前已认证 SSH 会话的信息。"
         fi
     fi
     if ssh_source_allowed "$source" "$server_port" "$family"; then return 0; fi
 
-    printf '\n%sCRITICAL WARNING%s\n\n' "$(color '1;31')" "$(color 0)" >&2
-    printf 'Current SSH session: %s -> TCP/%s\n' "$source" "$server_port" >&2
-    printf 'The current SSH source is not permitted by the new PortSentinel rule.\n' >&2
-    printf 'Applying this policy may terminate your SSH session.\n\n' >&2
+    printf '\n%s严重警告%s\n\n' "$(color '1;31')" "$(color 0)" >&2
+    printf '当前 SSH 会话：%s -> TCP/%s\n' "$source" "$server_port" >&2
+    printf '新的 PortSentinel 规则不允许当前 SSH 来源访问。\n' >&2
+    printf '应用此策略可能会中断当前 SSH 会话。\n\n' >&2
     if [[ "$PRESERVE_CURRENT_SSH" == 1 ]]; then
         PRESERVE_SSH_SOURCE="$source"; PRESERVE_SSH_FAMILY="$family"; PRESERVE_SSH_PORT="$server_port"
-        info "Current SSH source will be inserted into this candidate only; config.json is unchanged."
+        info "当前 SSH 来源只会临时加入本次候选规则，config.json 不会改变。"
         return 0
     fi
     [[ "$NON_INTERACTIVE" == 0 ]] || return 1
     local answer
-    read -r -p 'Type PRESERVE CURRENT SSH for a one-apply exception, or APPLY ANYWAY: ' answer
+    read -r -p '输入 PRESERVE CURRENT SSH 临时保留当前会话，或输入 APPLY ANYWAY 强制继续：' answer
     case "$answer" in
         'PRESERVE CURRENT SSH')
             PRESERVE_SSH_SOURCE="$source"; PRESERVE_SSH_FAMILY="$family"; PRESERVE_SSH_PORT="$server_port"
-            info "Current SSH source will be inserted into this candidate only; config.json is unchanged."
+            info "当前 SSH 来源只会临时加入本次候选规则，config.json 不会改变。"
             ;;
         'APPLY ANYWAY') ;;
         *) return 1 ;;
@@ -526,13 +526,13 @@ preflight_apply() {
     need_command "$IPTABLES_RESTORE"
     if [[ "$(ipv6_state)" == disabled ]]; then
         SKIP_IPV6=1
-        warn "IPv6: Disabled by system. IPv6 policy remains stored but will not be applied."
+        warn "IPv6：已被系统禁用。IPv6 策略仍会保存，但本次不会应用。"
     else
         need_command "$IP6TABLES"
         need_command "$IP6TABLES_SAVE"
         need_command "$IP6TABLES_RESTORE"
     fi
-    ssh_lockout_check || die "Apply cancelled to protect the current SSH session."
+    ssh_lockout_check || die "为保护当前 SSH 会话，已取消应用。"
     generate_rules
 }
 
@@ -542,13 +542,13 @@ apply_cmd() {
             --dry-run) DRY_RUN=1 ;;
             --non-interactive) NON_INTERACTIVE=1 ;;
             --preserve-current-ssh) PRESERVE_CURRENT_SSH=1 ;;
-            *) die "Unknown apply option: $1" ;;
+            *) die "未知的 apply 选项：$1" ;;
         esac
         shift
     done
-    [[ -f "$CONFIG_FILE" ]] || { info "No configuration exists; nothing to apply."; return 0; }
+    [[ -f "$CONFIG_FILE" ]] || { info "配置文件不存在，无需应用。"; return 0; }
     if [[ "$(jq -r '.rules | length' "$CONFIG_FILE" 2>/dev/null || printf invalid)" == 0 ]]; then
-        info "Configuration has no protected ports; nothing to apply."
+        info "配置中没有受保护端口，无需应用。"
         return 0
     fi
     preflight_apply
@@ -563,27 +563,27 @@ apply_cmd() {
     TRANSACTION_ACTIVE=1
     if ! stage_family "$IPTABLES" RULES_V4 4; then
         rollback_transaction ipv4-stage-failure
-        die "IPv4 candidate failed; both families were rolled back."
+        die "IPv4 候选规则失败，IPv4 和 IPv6 均已回滚。"
     fi
     if (( ! SKIP_IPV6 )); then
         if ! stage_family "$IP6TABLES" RULES_V6 6; then
             rollback_transaction ipv6-stage-failure
-            die "IPv6 candidate failed; both families were rolled back."
+            die "IPv6 候选规则失败，IPv4 和 IPv6 均已回滚。"
         fi
     fi
     if ! switch_family "$IPTABLES" 4; then
         rollback_transaction ipv4-switch-failure
-        die "IPv4 switch failed; both families were rolled back."
+        die "IPv4 规则切换失败，IPv4 和 IPv6 均已回滚。"
     fi
     if (( ! SKIP_IPV6 )); then
         if ! switch_family "$IP6TABLES" 6; then
             rollback_transaction ipv6-switch-failure
-            die "IPv6 switch failed; both families were rolled back."
+            die "IPv6 规则切换失败，IPv4 和 IPv6 均已回滚。"
         fi
     fi
     TRANSACTION_ACTIVE=0
     log_event apply success "backup=${TRANSACTION_BACKUP} ipv6_skipped=${SKIP_IPV6}"
-    info "Configuration applied successfully. Backup: ${TRANSACTION_BACKUP}"
+    info "配置应用成功。备份编号：${TRANSACTION_BACKUP}"
 }
 
 backup_cmd() {
@@ -591,7 +591,7 @@ backup_cmd() {
     need_command "$IPTABLES_SAVE"; need_command "$IP6TABLES_SAVE"
     local stamp
     stamp="$(create_backup)"
-    info "Backup created: $stamp"
+    info "备份已创建：$stamp"
 }
 
 list_backups() {
@@ -609,20 +609,20 @@ restore_cmd() {
     local stamp="${1:-}"
     if [[ -z "$stamp" ]]; then
         list_backups
-        [[ "$NON_INTERACTIVE" == 0 ]] || die "A backup timestamp is required in non-interactive mode."
-        read -r -p 'Backup timestamp to restore: ' stamp
+        [[ "$NON_INTERACTIVE" == 0 ]] || die "非交互模式必须指定备份时间戳。"
+        read -r -p '请输入要恢复的备份时间戳：' stamp
     fi
-    [[ "$stamp" =~ ^[0-9]{8}-[0-9]{6}(-[0-9]+)?$ ]] || die "Invalid backup timestamp."
+    [[ "$stamp" =~ ^[0-9]{8}-[0-9]{6}(-[0-9]+)?$ ]] || die "备份时间戳无效。"
     local safety
     safety="$(create_backup "$(date -u '+%Y%m%d-%H%M%S')-pre-restore")"
     TRANSACTION_BACKUP="$safety"; TRANSACTION_ACTIVE=1
     if restore_backup_set "$stamp"; then
         TRANSACTION_ACTIVE=0
         log_event restore success "set=${stamp} safety=${safety}"
-        info "Restored IPv4 and IPv6 backup set: $stamp"
+        info "已恢复 IPv4 和 IPv6 备份组：$stamp"
     else
         rollback_transaction restore-failure
-        die "Restore failed; the pre-restore firewall was reinstated."
+        die "恢复失败，已重新恢复操作前的防火墙状态。"
     fi
 }
 
@@ -641,46 +641,46 @@ reset_cmd() {
     require_root
     if [[ "$NON_INTERACTIVE" == 0 ]]; then
         local answer
-        read -r -p 'Type RESET PORTSENTINEL to remove only PortSentinel firewall rules: ' answer
-        [[ "$answer" == 'RESET PORTSENTINEL' ]] || { info "Reset cancelled."; return 0; }
+        read -r -p '输入 RESET PORTSENTINEL，仅删除 PortSentinel 防火墙规则：' answer
+        [[ "$answer" == 'RESET PORTSENTINEL' ]] || { info "已取消重置。"; return 0; }
     fi
     acquire_lock
     remove_family_rules "$IPTABLES"
     remove_family_rules "$IP6TABLES"
     log_event reset success
-    info "PortSentinel INPUT jumps and private chains removed. Configuration was kept."
+    info "已删除 PortSentinel 的 INPUT jump 和私有链，配置文件已保留。"
 }
 
 status_cmd() {
-    local v4_status=Unavailable v6_status=Unavailable v4_backend='not found' v6_backend='not found'
+    local v4_status=不可用 v6_status=不可用 v4_backend='未找到' v6_backend='未找到'
     if command -v "$IPTABLES" >/dev/null 2>&1; then
         v4_backend="$($IPTABLES --version 2>/dev/null || true)"
-        family_chain_exists "$IPTABLES" "$CHAIN" && v4_status=Active || v4_status=Inactive
+        family_chain_exists "$IPTABLES" "$CHAIN" && v4_status=已启用 || v4_status=未启用
     fi
     if [[ "$(ipv6_state)" == disabled ]]; then
-        v6_status='Disabled by system'
+        v6_status='已被系统禁用'
     elif command -v "$IP6TABLES" >/dev/null 2>&1; then
         v6_backend="$($IP6TABLES --version 2>/dev/null || true)"
-        family_chain_exists "$IP6TABLES" "$CHAIN" && v6_status=Active || v6_status=Inactive
+        family_chain_exists "$IP6TABLES" "$CHAIN" && v6_status=已启用 || v6_status=未启用
     fi
     printf 'PortSentinel %s\n' "$VERSION"
-    printf 'IPv4 Backend : %s\nIPv4 Status  : %s\n' "$v4_backend" "$v4_status"
-    printf 'IPv6 Backend : %s\nIPv6 Status  : %s\n' "$v6_backend" "$v6_status"
+    printf 'IPv4 后端：%s\nIPv4 状态：%s\n' "$v4_backend" "$v4_status"
+    printf 'IPv6 后端：%s\nIPv6 状态：%s\n' "$v6_backend" "$v6_status"
     if [[ -f "$CONFIG_FILE" ]] && validate_config >/dev/null 2>&1; then
-        printf 'Protected Ports: %s\nIP Groups      : %s\n' "$(jq '.rules|length' "$CONFIG_FILE")" "$(jq '.groups|length' "$CONFIG_FILE")"
+        printf '受保护端口：%s\nIP Group 数量：%s\n' "$(jq '.rules|length' "$CONFIG_FILE")" "$(jq '.groups|length' "$CONFIG_FILE")"
     else
-        printf 'Configuration: missing or invalid\n'
+        printf '配置状态：不存在或无效\n'
     fi
 }
 
 list_rules() {
     ensure_config
-    printf '%-3s %-24s %-8s %-12s %-12s %-12s\n' ID NAME PROTO PORT IPv4 IPv6
+    printf '%-3s %-24s %-8s %-12s %-12s %-12s\n' ID 名称 协议 端口 IPv4 IPv6
     jq -r '.rules | to_entries[] | [(.key+1), .value.name, (.value.protocol|ascii_upcase), .value.port,
       ((.value.groups|join(",")) // ""), ((.value.groups|join(",")) // "")] | @tsv' "$CONFIG_FILE" |
     while IFS=$'\t' read -r id name proto port group4 group6; do
-        [[ -n "$group4" ]] || group4="custom/$(jq -r --argjson i "$((id-1))" '.rules[$i].ipv4_default|ascii_upcase' "$CONFIG_FILE")"
-        [[ -n "$group6" ]] || group6="custom/$(jq -r --argjson i "$((id-1))" '.rules[$i].ipv6_default|ascii_upcase' "$CONFIG_FILE")"
+        [[ -n "$group4" ]] || group4="自定义/$(jq -r --argjson i "$((id-1))" '.rules[$i].ipv4_default|ascii_upcase' "$CONFIG_FILE")"
+        [[ -n "$group6" ]] || group6="自定义/$(jq -r --argjson i "$((id-1))" '.rules[$i].ipv6_default|ascii_upcase' "$CONFIG_FILE")"
         printf '%-3s %-24.24s %-8s %-12s %-12.12s %-12.12s\n' "$id" "$name" "$proto" "$port" "$group4" "$group6"
     done
 }
@@ -691,43 +691,43 @@ list_groups() {
 }
 
 effective_rules_cmd() {
-    ensure_config; validate_config || die "Invalid configuration."
+    ensure_config; validate_config || die "配置文件无效。"
     local count index name proto port family default source
     count="$(jq '.rules|length' "$CONFIG_FILE")"
     for ((index=0; index<count; index++)); do
         name="$(jq -r --argjson i "$index" '.rules[$i].name' "$CONFIG_FILE")"
         proto="$(jq -r --argjson i "$index" '.rules[$i].protocol|ascii_upcase' "$CONFIG_FILE")"
         port="$(jq -r --argjson i "$index" '.rules[$i].port' "$CONFIG_FILE")"
-        printf '\nRule: %s\n%s/%s\n' "$name" "$proto" "$port"
+        printf '\n规则：%s\n%s/%s\n' "$name" "$proto" "$port"
         for family in 4 6; do
             default="$(jq -r --argjson i "$index" --arg key "ipv${family}_default" '.rules[$i][$key]|ascii_upcase' "$CONFIG_FILE")"
-            printf '\nIPv%s:\nALLOW\n' "$family"
+            printf '\nIPv%s：\n允许来源\n' "$family"
             while IFS= read -r source; do printf '  %s\n' "$source"; done < <(collect_sources "$index" "$family")
-            printf 'DEFAULT\n  %s\n' "$default"
+            printf '默认策略\n  %s\n' "$default"
         done
     done
     if [[ "${EUID}" -eq 0 ]]; then
-        printf '\n===== IPv4 counters =====\n'; "$IPTABLES" -w 5 -L "$CHAIN" -n -v --line-numbers 2>/dev/null || printf 'Chain is not active.\n'
-        printf '\n===== IPv6 counters =====\n'; "$IP6TABLES" -w 5 -L "$CHAIN" -n -v --line-numbers 2>/dev/null || printf 'Chain is not active.\n'
+        printf '\n===== IPv4 计数器 =====\n'; "$IPTABLES" -w 5 -L "$CHAIN" -n -v --line-numbers 2>/dev/null || printf '规则链尚未启用。\n'
+        printf '\n===== IPv6 计数器 =====\n'; "$IP6TABLES" -w 5 -L "$CHAIN" -n -v --line-numbers 2>/dev/null || printf '规则链尚未启用。\n'
     fi
 }
 
 add_group() {
     local name
-    read -r -p 'Group name: ' name
-    [[ "$name" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$ ]] || die "Invalid group name."
-    jq -e --arg name "$name" '.groups|has($name)|not' "$CONFIG_FILE" >/dev/null || die "Group already exists."
+    read -r -p '请输入 IP Group 名称：' name
+    [[ "$name" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$ ]] || die "IP Group 名称无效。"
+    jq -e --arg name "$name" '.groups|has($name)|not' "$CONFIG_FILE" >/dev/null || die "该 IP Group 已存在。"
     config_edit group-add --arg name "$name" '.groups[$name]={ipv4:[],ipv6:[]}'
 }
 
 add_group_address() {
     local name family address key
-    read -r -p 'Group name: ' name
-    jq -e --arg name "$name" '.groups|has($name)' "$CONFIG_FILE" >/dev/null || die "Unknown group."
-    read -r -p 'Address family (4/6): ' family
-    [[ "$family" == 4 || "$family" == 6 ]] || die "Family must be 4 or 6."
-    read -r -p 'IP address or CIDR: ' address
-    validate_address "$address" "$family" || die "Invalid IPv${family} address or CIDR."
+    read -r -p '请输入 IP Group 名称：' name
+    jq -e --arg name "$name" '.groups|has($name)' "$CONFIG_FILE" >/dev/null || die "找不到该 IP Group。"
+    read -r -p '请选择地址族（4/6）：' family
+    [[ "$family" == 4 || "$family" == 6 ]] || die "地址族只能是 4 或 6。"
+    read -r -p '请输入 IP 地址或 CIDR：' address
+    validate_address "$address" "$family" || die "IPv${family} 地址或 CIDR 无效。"
     key="ipv${family}"
     config_edit group-address-add --arg name "$name" --arg key "$key" --arg address "$address" \
       '.groups[$name][$key] = ((.groups[$name][$key] + [$address]) | unique)'
@@ -735,8 +735,8 @@ add_group_address() {
 
 remove_group_address() {
     local name family address key
-    read -r -p 'Group name: ' name; read -r -p 'Address family (4/6): ' family; read -r -p 'Exact address/CIDR to remove: ' address
-    [[ "$family" == 4 || "$family" == 6 ]] || die "Family must be 4 or 6."
+    read -r -p '请输入 IP Group 名称：' name; read -r -p '请选择地址族（4/6）：' family; read -r -p '请输入要删除的完整地址/CIDR：' address
+    [[ "$family" == 4 || "$family" == 6 ]] || die "地址族只能是 4 或 6。"
     key="ipv${family}"
     config_edit group-address-remove --arg name "$name" --arg key "$key" --arg address "$address" \
       '.groups[$name][$key] |= map(select(. != $address))'
@@ -744,49 +744,49 @@ remove_group_address() {
 
 rename_group() {
     local old new
-    read -r -p 'Current group name: ' old; read -r -p 'New group name: ' new
-    [[ "$new" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$ ]] || die "Invalid group name."
-    jq -e --arg old "$old" --arg new "$new" '.groups|has($old) and (has($new)|not)' "$CONFIG_FILE" >/dev/null || die "Source missing or destination exists."
+    read -r -p '当前 IP Group 名称：' old; read -r -p '新的 IP Group 名称：' new
+    [[ "$new" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$ ]] || die "IP Group 名称无效。"
+    jq -e --arg old "$old" --arg new "$new" '.groups|has($old) and (has($new)|not)' "$CONFIG_FILE" >/dev/null || die "原 Group 不存在，或新名称已被占用。"
     config_edit group-rename --arg old "$old" --arg new "$new" \
       '.groups[$new]=.groups[$old] | del(.groups[$old]) | .rules |= map(.groups |= map(if . == $old then $new else . end))'
 }
 
 delete_group() {
     local name refs answer
-    read -r -p 'Group name: ' name
+    read -r -p '请输入 IP Group 名称：' name
     refs="$(jq -r --arg name "$name" '[.rules[]|select(.groups|index($name))]|length' "$CONFIG_FILE")"
     if (( refs > 0 )); then
-        warn "Group is referenced by ${refs} rule(s)."
-        read -r -p 'Type DELETE REFERENCED GROUP to detach and delete: ' answer
-        [[ "$answer" == 'DELETE REFERENCED GROUP' ]] || { info "Delete cancelled."; return; }
+        warn "该 IP Group 正被 ${refs} 条规则引用。"
+        read -r -p '输入 DELETE REFERENCED GROUP 以解除引用并删除：' answer
+        [[ "$answer" == 'DELETE REFERENCED GROUP' ]] || { info "已取消删除。"; return; }
     fi
     config_edit group-delete --arg name "$name" 'del(.groups[$name]) | .rules |= map(.groups -= [$name])'
 }
 
 groups_menu() {
     while true; do
-        printf '\nIP Groups\n[1] List\n[2] Create\n[3] Rename\n[4] Delete\n[5] Add address/CIDR\n[6] Remove address/CIDR\n[0] Back\n'
+        printf '\nIP Group 管理\n[1] 查看列表\n[2] 创建 Group\n[3] 重命名 Group\n[4] 删除 Group\n[5] 添加地址/CIDR\n[6] 删除地址/CIDR\n[0] 返回\n'
         local choice; read -r -p '> ' choice
-        case "$choice" in 1) list_groups;; 2) add_group;; 3) rename_group;; 4) delete_group;; 5) add_group_address;; 6) remove_group_address;; 0) return;; *) warn "Invalid choice.";; esac
+        case "$choice" in 1) list_groups;; 2) add_group;; 3) rename_group;; 4) delete_group;; 5) add_group_address;; 6) remove_group_address;; 0) return;; *) warn "选项无效。";; esac
     done
 }
 
 access_prompt() {
     local family="$1" default_var="$2" sources_var="$3"
     local choice value="" default=drop sources='[]'
-    printf 'IPv%s direct access: [1] Custom addresses [2] Block all [3] Leave unrestricted\n' "$family"
+    printf 'IPv%s 访问策略：[1] 自定义地址 [2] 全部阻止 [3] 保持不限制\n' "$family"
     read -r -p '> ' choice
     case "$choice" in
         1)
-            read -r -p 'Addresses/CIDRs (comma-separated): ' value
+            read -r -p '请输入地址/CIDR（多个值用逗号分隔）：' value
             local item
             IFS=',' read -r -a items <<<"$value"
-            for item in "${items[@]}"; do validate_address "$item" "$family" || die "Invalid IPv${family}: $item"; done
+            for item in "${items[@]}"; do validate_address "$item" "$family" || die "IPv${family} 地址无效：$item"; done
             sources="$(printf '%s\n' "${items[@]}" | jq -R . | jq -s 'unique')"
             ;;
         2|'') default=drop ;;
         3) default=accept ;;
-        *) die "Invalid access choice." ;;
+        *) die "访问策略选项无效。" ;;
     esac
     printf -v "$default_var" '%s' "$default"
     printf -v "$sources_var" '%s' "$sources"
@@ -794,16 +794,16 @@ access_prompt() {
 
 add_rule() {
     local name port proto_choice protocol v4_default v6_default groups_text v4_sources v6_sources
-    read -r -p 'Rule name: ' name; [[ -n "$name" ]] || die "Rule name is required."
-    read -r -p 'Port or range (for example 10773 or 20000:20100): ' port; validate_port "$port" || die "Invalid port."
-    printf 'Protocol: [1] TCP [2] UDP [3] TCP + UDP\n'; read -r -p '> ' proto_choice
-    case "$proto_choice" in 1) protocol=tcp;; 2) protocol=udp;; 3) protocol=both;; *) die "Invalid protocol.";; esac
-    printf 'Attached IP groups contribute both their IPv4 and IPv6 members.\n'
-    read -r -p 'Group names (comma-separated, blank for none): ' groups_text
+    read -r -p '请输入规则名称：' name; [[ -n "$name" ]] || die "规则名称不能为空。"
+    read -r -p '请输入端口或范围（例如 10773 或 20000:20100）：' port; validate_port "$port" || die "端口无效。"
+    printf '请选择协议：[1] TCP [2] UDP [3] TCP + UDP\n'; read -r -p '> ' proto_choice
+    case "$proto_choice" in 1) protocol=tcp;; 2) protocol=udp;; 3) protocol=both;; *) die "协议选项无效。";; esac
+    printf '绑定的 IP Group 会同时提供其 IPv4 和 IPv6 成员。\n'
+    read -r -p '请输入 IP Group 名称（多个用逗号分隔，不绑定请留空）：' groups_text
     local group_json
     group_json="$(printf '%s' "$groups_text" | tr ',' '\n' | sed '/^$/d' | jq -R . | jq -s 'unique')"
     local group
-    while IFS= read -r group; do jq -e --arg group "$group" '.groups|has($group)' "$CONFIG_FILE" >/dev/null || die "Unknown group: $group"; done < <(jq -r '.[]' <<<"$group_json")
+    while IFS= read -r group; do jq -e --arg group "$group" '.groups|has($group)' "$CONFIG_FILE" >/dev/null || die "找不到 IP Group：$group"; done < <(jq -r '.[]' <<<"$group_json")
     access_prompt 4 v4_default v4_sources
     access_prompt 6 v6_default v6_sources
     config_edit rule-add --arg name "$name" --arg protocol "$protocol" --arg port "$port" \
@@ -815,45 +815,45 @@ add_rule() {
 read_rule_index() {
     local index_var="$1" selected_id count
     list_rules
-    read -r -p 'Rule ID: ' selected_id
-    [[ "$selected_id" =~ ^[0-9]+$ ]] || die "Invalid rule ID."
+    read -r -p '请输入规则 ID：' selected_id
+    [[ "$selected_id" =~ ^[0-9]+$ ]] || die "规则 ID 无效。"
     count="$(jq '.rules|length' "$CONFIG_FILE")"
-    (( selected_id >= 1 && selected_id <= count )) || die "Rule ID out of range."
+    (( selected_id >= 1 && selected_id <= count )) || die "规则 ID 超出范围。"
     printf -v "$index_var" '%s' "$((selected_id-1))"
 }
 
 edit_rule() {
     local index field value
     read_rule_index index
-    printf '[1] Name [2] Port [3] Protocol [4] IPv4 default [5] IPv6 default\n'
+    printf '[1] 名称 [2] 端口 [3] 协议 [4] IPv4 默认策略 [5] IPv6 默认策略\n'
     read -r -p '> ' field
     case "$field" in
         1)
-            read -r -p 'New name: ' value; [[ -n "$value" ]] || die "Name is required."
+            read -r -p '请输入新名称：' value; [[ -n "$value" ]] || die "名称不能为空。"
             config_edit rule-edit --argjson i "$index" --arg value "$value" '.rules[$i].name=$value'
             ;;
         2)
-            read -r -p 'New port/range: ' value; validate_port "$value" || die "Invalid port."
+            read -r -p '请输入新端口/范围：' value; validate_port "$value" || die "端口无效。"
             config_edit rule-edit --argjson i "$index" --arg value "$value" '.rules[$i].port=$value'
             ;;
         3)
-            read -r -p 'Protocol (tcp/udp/both): ' value; [[ "$value" == tcp || "$value" == udp || "$value" == both ]] || die "Invalid protocol."
+            read -r -p '请输入协议（tcp/udp/both）：' value; [[ "$value" == tcp || "$value" == udp || "$value" == both ]] || die "协议无效。"
             config_edit rule-edit --argjson i "$index" --arg value "$value" '.rules[$i].protocol=$value'
             ;;
         4|5)
-            read -r -p 'Default (drop/accept): ' value; [[ "$value" == drop || "$value" == accept ]] || die "Invalid default."
+            read -r -p '请输入默认策略（drop/accept）：' value; [[ "$value" == drop || "$value" == accept ]] || die "默认策略无效。"
             local key; [[ "$field" == 4 ]] && key=ipv4_default || key=ipv6_default
             config_edit rule-edit --argjson i "$index" --arg key "$key" --arg value "$value" '.rules[$i][$key]=$value'
             ;;
-        *) die "Invalid edit choice." ;;
+        *) die "编辑选项无效。" ;;
     esac
 }
 
 add_rule_source() {
     local index family address key
     read_rule_index index
-    read -r -p 'Address family (4/6): ' family; [[ "$family" == 4 || "$family" == 6 ]] || die "Family must be 4 or 6."
-    read -r -p 'Address or CIDR: ' address; validate_address "$address" "$family" || die "Invalid address."
+    read -r -p '请选择地址族（4/6）：' family; [[ "$family" == 4 || "$family" == 6 ]] || die "地址族只能是 4 或 6。"
+    read -r -p '请输入地址或 CIDR：' address; validate_address "$address" "$family" || die "地址无效。"
     key="ipv${family}"
     config_edit rule-source-add --argjson i "$index" --arg key "$key" --arg address "$address" \
       '.rules[$i].sources[$key] = ((.rules[$i].sources[$key] + [$address]) | unique)'
@@ -862,41 +862,41 @@ add_rule_source() {
 remove_rule_source() {
     local index family address key
     read_rule_index index
-    read -r -p 'Address family (4/6): ' family; [[ "$family" == 4 || "$family" == 6 ]] || die "Family must be 4 or 6."
-    read -r -p 'Exact address or CIDR: ' address; key="ipv${family}"
+    read -r -p '请选择地址族（4/6）：' family; [[ "$family" == 4 || "$family" == 6 ]] || die "地址族只能是 4 或 6。"
+    read -r -p '请输入完整地址或 CIDR：' address; key="ipv${family}"
     config_edit rule-source-remove --argjson i "$index" --arg key "$key" --arg address "$address" \
       '.rules[$i].sources[$key] |= map(select(. != $address))'
 }
 
 attach_rule_group() {
     local index group
-    read_rule_index index; read -r -p 'Group name: ' group
-    jq -e --arg group "$group" '.groups|has($group)' "$CONFIG_FILE" >/dev/null || die "Unknown group."
+    read_rule_index index; read -r -p '请输入 IP Group 名称：' group
+    jq -e --arg group "$group" '.groups|has($group)' "$CONFIG_FILE" >/dev/null || die "找不到该 IP Group。"
     config_edit rule-group-attach --argjson i "$index" --arg group "$group" '.rules[$i].groups = ((.rules[$i].groups + [$group]) | unique)'
 }
 
 detach_rule_group() {
     local index group
-    read_rule_index index; read -r -p 'Group name: ' group
+    read_rule_index index; read -r -p '请输入 IP Group 名称：' group
     config_edit rule-group-detach --argjson i "$index" --arg group "$group" '.rules[$i].groups -= [$group]'
 }
 
 delete_rule() {
     list_rules
     local id answer count
-    read -r -p 'Rule ID to delete: ' id; [[ "$id" =~ ^[0-9]+$ ]] || die "Invalid ID."
-    count="$(jq '.rules|length' "$CONFIG_FILE")"; (( id >= 1 && id <= count )) || die "Rule ID out of range."
-    read -r -p 'Type DELETE RULE to confirm: ' answer; [[ "$answer" == 'DELETE RULE' ]] || { info "Delete cancelled."; return; }
+    read -r -p '请输入要删除的规则 ID：' id; [[ "$id" =~ ^[0-9]+$ ]] || die "规则 ID 无效。"
+    count="$(jq '.rules|length' "$CONFIG_FILE")"; (( id >= 1 && id <= count )) || die "规则 ID 超出范围。"
+    read -r -p '输入 DELETE RULE 确认删除：' answer; [[ "$answer" == 'DELETE RULE' ]] || { info "已取消删除。"; return; }
     config_edit rule-delete --argjson i "$((id-1))" 'del(.rules[$i])'
 }
 
 protected_ports_menu() {
     while true; do
-        printf '\nProtected Ports\n[1] List / View\n[2] Add\n[3] Edit\n[4] Delete\n[5] Add source\n[6] Remove source\n[7] Attach group\n[8] Detach group\n[0] Back\n'
+        printf '\n受保护端口管理\n[1] 查看列表/详情\n[2] 添加规则\n[3] 编辑规则\n[4] 删除规则\n[5] 添加来源\n[6] 删除来源\n[7] 绑定 IP Group\n[8] 解绑 IP Group\n[0] 返回\n'
         local choice; read -r -p '> ' choice
         case "$choice" in
             1) list_rules;; 2) add_rule;; 3) edit_rule;; 4) delete_rule;; 5) add_rule_source;; 6) remove_rule_source;;
-            7) attach_rule_group;; 8) detach_rule_group;; 0) return;; *) warn "Invalid choice.";;
+            7) attach_rule_group;; 8) detach_rule_group;; 0) return;; *) warn "选项无效。";;
         esac
     done
 }
@@ -907,10 +907,10 @@ update_cmd() {
     local temp
     temp="$(mktemp /tmp/portsentinel-install.XXXXXX)"
     trap 'rm -f -- "$temp"' RETURN
-    info "Downloading the repository installer from ${UPDATE_INSTALLER_URL}"
+    info "正在从 ${UPDATE_INSTALLER_URL} 下载安装程序"
     curl -fsSL --proto '=https' --tlsv1.2 "$UPDATE_INSTALLER_URL" -o "$temp"
-    bash -n "$temp" || die "Downloaded installer failed syntax validation."
-    grep -q 'PortSentinel installer' "$temp" || die "Downloaded file is not a PortSentinel installer."
+    bash -n "$temp" || die "下载的安装程序未通过 Bash 语法检查。"
+    grep -q 'PortSentinel installer' "$temp" || die "下载的文件不是有效的 PortSentinel 安装程序。"
     bash "$temp" --update
     rm -f -- "$temp"
     trap - RETURN
@@ -921,50 +921,50 @@ uninstall_cmd() {
     require_root
     local helper=/usr/local/lib/portsentinel/uninstall.sh
     if [[ -x "$helper" ]]; then exec "$helper"; fi
-    die "Uninstall helper not found. Re-run install.sh, then use portsentinel uninstall."
+    die "找不到卸载程序。请重新运行 install.sh，然后执行 portsentinel uninstall。"
 }
 
 tui() {
     ensure_config
     while true; do
         clear 2>/dev/null || true
-        printf '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n PortSentinel\n Dual-Stack Port Whitelist Manager\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n'
-        printf ' IPv4 Backend      : %s\n' "$(command -v "$IPTABLES" >/dev/null 2>&1 && printf iptables || printf Unavailable)"
-        printf ' IPv6 Backend      : %s\n' "$(command -v "$IP6TABLES" >/dev/null 2>&1 && printf ip6tables || printf Unavailable)"
-        printf ' IPv4              : Enabled\n IPv6              : %s\n' "$(ipv6_state | sed 's/^./\U&/')"
-        printf ' Protected Ports   : %s\n IP Groups         : %s\n\n' "$(jq '.rules|length' "$CONFIG_FILE")" "$(jq '.groups|length' "$CONFIG_FILE")"
-        printf ' [1] Protected Ports\n [2] IP Groups\n [3] Add Rule\n [4] Delete Rule\n [5] Show Effective Rules\n [6] Apply Configuration\n [7] Backup / Restore\n [8] Firewall Status\n [9] Reset PortSentinel Rules\n\n [u] Update\n [0] Exit\n\n'
+        printf '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n PortSentinel\n Linux 双栈端口白名单管理工具\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n'
+        printf ' IPv4 后端       ：%s\n' "$(command -v "$IPTABLES" >/dev/null 2>&1 && printf iptables || printf 不可用)"
+        printf ' IPv6 后端       ：%s\n' "$(command -v "$IP6TABLES" >/dev/null 2>&1 && printf ip6tables || printf 不可用)"
+        printf ' IPv4 状态       ：已启用\n IPv6 状态       ：%s\n' "$(ipv6_state | sed 's/enabled/已启用/; s/disabled/已被系统禁用/')"
+        printf ' 受保护端口数量 ：%s\n IP Group 数量   ：%s\n\n' "$(jq '.rules|length' "$CONFIG_FILE")" "$(jq '.groups|length' "$CONFIG_FILE")"
+        printf ' [1] 受保护端口\n [2] IP Group 管理\n [3] 添加规则\n [4] 删除规则\n [5] 查看有效规则\n [6] 应用配置\n [7] 备份 / 恢复\n [8] 防火墙状态\n [9] 重置 PortSentinel 规则\n\n [u] 一键更新\n [0] 退出\n\n'
         local choice; read -r -p '> ' choice
         case "$choice" in
             1) protected_ports_menu;; 2) groups_menu;; 3) add_rule;; 4) delete_rule;;
             5) effective_rules_cmd;; 6) apply_cmd;;
-            7) printf '[1] Backup [2] Restore\n'; read -r -p '> ' choice; if [[ "$choice" == 1 ]]; then backup_cmd; else restore_cmd; fi;;
-            8) status_cmd;; 9) reset_cmd;; u|U) update_cmd;; 0) return;; *) warn "Invalid choice.";;
+            7) printf '[1] 创建备份 [2] 恢复备份\n'; read -r -p '> ' choice; if [[ "$choice" == 1 ]]; then backup_cmd; else restore_cmd; fi;;
+            8) status_cmd;; 9) reset_cmd;; u|U) update_cmd;; 0) return;; *) warn "选项无效。";;
         esac
-        read -r -p 'Press Enter to continue...' _ || true
+        read -r -p '按 Enter 键继续...' _ || true
     done
 }
 
 usage() {
     cat <<'EOF'
-Usage: portsentinel [command]
+用法：portsentinel [命令]
 
-Commands:
-  status                         Show backend and policy status
-  list | rule list               List protected-port rules
-  group list                     List reusable IP groups
-  effective                     Show expanded policy and counters
+命令：
+  status                         查看后端与策略状态
+  list | rule list               列出受保护端口规则
+  group list                     列出可复用的 IP Group
+  effective                     查看展开后的规则与计数器
   apply [--dry-run] [--non-interactive]
-                                 Validate and transactionally apply both families
-  backup                         Save paired IPv4/IPv6 firewall backup
-  restore [TIMESTAMP]            Restore a paired backup set
-  reset [--non-interactive]      Remove only PortSentinel firewall rules
-  update                         Download, validate, and run the latest installer
-  uninstall                      Remove PortSentinel safely
-  version                        Print the version
-  help                           Show this help
+                                 验证并以事务方式应用 IPv4/IPv6 策略
+  backup                         保存成对的 IPv4/IPv6 防火墙备份
+  restore [时间戳]               恢复一组成对备份
+  reset [--non-interactive]      仅删除 PortSentinel 防火墙规则
+  update                         下载、验证并运行最新安装程序
+  uninstall                      安全卸载 PortSentinel
+  version                        显示版本
+  help                           显示帮助
 
-Run without a command for the interactive menu.
+不带命令运行即可进入交互式管理面板。
 EOF
 }
 
@@ -976,8 +976,8 @@ main() {
         '') tui;;
         status) status_cmd "$@";;
         list) list_rules "$@";;
-        rule) [[ "${1:-}" == list ]] || die "Usage: portsentinel rule list"; list_rules;;
-        group) [[ "${1:-}" == list ]] || die "Usage: portsentinel group list"; list_groups;;
+        rule) [[ "${1:-}" == list ]] || die "用法：portsentinel rule list"; list_rules;;
+        group) [[ "${1:-}" == list ]] || die "用法：portsentinel group list"; list_groups;;
         effective) effective_rules_cmd;;
         apply) apply_cmd "$@";;
         backup) backup_cmd "$@";;
@@ -987,7 +987,7 @@ main() {
         uninstall) uninstall_cmd;;
         version|--version|-V) printf 'PortSentinel %s\n' "$VERSION";;
         help|--help|-h) usage;;
-        *) usage >&2; die "Unknown command: $command";;
+        *) usage >&2; die "未知命令：$command";;
     esac
 }
 
