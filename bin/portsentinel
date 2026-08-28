@@ -3,7 +3,7 @@
 set -Eeuo pipefail
 umask 077
 
-readonly VERSION="1.0.0"
+readonly VERSION="1.1.0"
 readonly CHAIN="PORTSENTINEL"
 readonly STAGE_CHAIN="PORTSENTINEL_NEW"
 readonly OLD_CHAIN="PORTSENTINEL_OLD"
@@ -771,45 +771,68 @@ groups_menu() {
     done
 }
 
-access_prompt() {
-    local family="$1" default_var="$2" sources_var="$3"
-    local choice value="" default=drop sources='[]'
-    printf 'IPv%s 访问策略：[1] 自定义地址 [2] 全部阻止 [3] 保持不限制\n' "$family"
-    read -r -p '> ' choice
-    case "$choice" in
-        1)
-            read -r -p '请输入地址/CIDR（多个值用逗号分隔）：' value
-            local item
-            IFS=',' read -r -a items <<<"$value"
-            for item in "${items[@]}"; do validate_address "$item" "$family" || die "IPv${family} 地址无效：$item"; done
-            sources="$(printf '%s\n' "${items[@]}" | jq -R . | jq -s 'unique')"
-            ;;
-        2|'') default=drop ;;
-        3) default=accept ;;
-        *) die "访问策略选项无效。" ;;
-    esac
-    printf -v "$default_var" '%s' "$default"
-    printf -v "$sources_var" '%s' "$sources"
+json_array_from_values() {
+    if (( $# == 0 )); then
+        printf '[]\n'
+    else
+        printf '%s\n' "$@" | jq -R . | jq -s 'unique'
+    fi
 }
 
 add_rule() {
-    local name port proto_choice protocol v4_default v6_default groups_text v4_sources v6_sources
+    local name port proto_choice protocol source_choice source_text group_json='[]'
+    local item raw group v4_sources='[]' v6_sources='[]'
+    local -a source_items=() v4_items=() v6_items=()
     read -r -p '请输入规则名称：' name; [[ -n "$name" ]] || die "规则名称不能为空。"
     read -r -p '请输入端口或范围（例如 10773 或 20000:20100）：' port; validate_port "$port" || die "端口无效。"
     printf '请选择协议：[1] TCP [2] UDP [3] TCP + UDP\n'; read -r -p '> ' proto_choice
     case "$proto_choice" in 1) protocol=tcp;; 2) protocol=udp;; 3) protocol=both;; *) die "协议选项无效。";; esac
-    printf '绑定的 IP Group 会同时提供其 IPv4 和 IPv6 成员。\n'
-    read -r -p '请输入 IP Group 名称（多个用逗号分隔，不绑定请留空）：' groups_text
-    local group_json
-    group_json="$(printf '%s' "$groups_text" | tr ',' '\n' | sed '/^$/d' | jq -R . | jq -s 'unique')"
-    local group
-    while IFS= read -r group; do jq -e --arg group "$group" '.groups|has($group)' "$CONFIG_FILE" >/dev/null || die "找不到 IP Group：$group"; done < <(jq -r '.[]' <<<"$group_json")
-    access_prompt 4 v4_default v4_sources
-    access_prompt 6 v6_default v6_sources
+
+    printf '请选择白名单来源：\n[1] 直接输入 IP/CIDR\n[2] 绑定 IP Group\n[3] 暂不添加来源（阻止所有访问）\n'
+    read -r -p '> ' source_choice
+    case "$source_choice" in
+        1)
+            read -r -p '请输入允许访问的 IP/CIDR（多个用逗号分隔，可混合 IPv4 和 IPv6）：' source_text
+            [[ -n "$source_text" ]] || die "IP/CIDR 不能为空。"
+            IFS=',' read -r -a source_items <<<"$source_text"
+            for raw in "${source_items[@]}"; do
+                item="${raw#"${raw%%[![:space:]]*}"}"
+                item="${item%"${item##*[![:space:]]}"}"
+                [[ -n "$item" ]] || die "IP/CIDR 不能为空。"
+                if validate_address "$item" 4 >/dev/null 2>&1; then
+                    v4_items+=("$item")
+                elif validate_address "$item" 6 >/dev/null 2>&1; then
+                    v6_items+=("$item")
+                else
+                    die "IP/CIDR 无效：$item"
+                fi
+            done
+            v4_sources="$(json_array_from_values "${v4_items[@]}")"
+            v6_sources="$(json_array_from_values "${v6_items[@]}")"
+            info "已识别 IPv4 ${#v4_items[@]} 个、IPv6 ${#v6_items[@]} 个来源。"
+            ;;
+        2)
+            if ! jq -e '.groups | length > 0' "$CONFIG_FILE" >/dev/null; then
+                die "尚未创建 IP Group。请先在 [2] IP Group 管理中创建，或选择直接输入 IP/CIDR。"
+            fi
+            printf '可用 IP Group：\n'
+            jq -r '.groups | keys[] | "  - \(.)"' "$CONFIG_FILE"
+            read -r -p '请输入 IP Group 名称（多个用逗号分隔）：' source_text
+            group_json="$(printf '%s' "$source_text" | tr ',' '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//;/^$/d' | jq -R . | jq -s 'unique')"
+            [[ "$(jq 'length' <<<"$group_json")" -gt 0 ]] || die "IP Group 名称不能为空。"
+            while IFS= read -r group; do
+                jq -e --arg group "$group" '.groups | has($group)' "$CONFIG_FILE" >/dev/null || die "找不到 IP Group：$group"
+            done < <(jq -r '.[]' <<<"$group_json")
+            ;;
+        3) ;;
+        *) die "白名单来源选项无效。" ;;
+    esac
+
     config_edit rule-add --arg name "$name" --arg protocol "$protocol" --arg port "$port" \
       --argjson groups "$group_json" --argjson v4 "$v4_sources" --argjson v6 "$v6_sources" \
-      --arg d4 "$v4_default" --arg d6 "$v6_default" \
+      --arg d4 drop --arg d6 drop \
       '.rules += [{name:$name,protocol:$protocol,port:$port,groups:$groups,sources:{ipv4:$v4,ipv6:$v6},ipv4_default:$d4,ipv6_default:$d6}]'
+    info "规则已保存。请返回主菜单选择 [6] 应用配置。"
 }
 
 read_rule_index() {
@@ -892,7 +915,7 @@ delete_rule() {
 
 protected_ports_menu() {
     while true; do
-        printf '\n受保护端口管理\n[1] 查看列表/详情\n[2] 添加规则\n[3] 编辑规则\n[4] 删除规则\n[5] 添加来源\n[6] 删除来源\n[7] 绑定 IP Group\n[8] 解绑 IP Group\n[0] 返回\n'
+        printf '\n受保护端口管理\n[1] 查看列表/详情\n[2] 添加端口保护\n[3] 编辑规则\n[4] 删除规则\n[5] 添加来源\n[6] 删除来源\n[7] 绑定 IP Group\n[8] 解绑 IP Group\n[0] 返回\n'
         local choice; read -r -p '> ' choice
         case "$choice" in
             1) list_rules;; 2) add_rule;; 3) edit_rule;; 4) delete_rule;; 5) add_rule_source;; 6) remove_rule_source;;
@@ -933,7 +956,7 @@ tui() {
         printf ' IPv6 后端       ：%s\n' "$(command -v "$IP6TABLES" >/dev/null 2>&1 && printf ip6tables || printf 不可用)"
         printf ' IPv4 状态       ：已启用\n IPv6 状态       ：%s\n' "$(ipv6_state | sed 's/enabled/已启用/; s/disabled/已被系统禁用/')"
         printf ' 受保护端口数量 ：%s\n IP Group 数量   ：%s\n\n' "$(jq '.rules|length' "$CONFIG_FILE")" "$(jq '.groups|length' "$CONFIG_FILE")"
-        printf ' [1] 受保护端口\n [2] IP Group 管理\n [3] 添加规则\n [4] 删除规则\n [5] 查看有效规则\n [6] 应用配置\n [7] 备份 / 恢复\n [8] 防火墙状态\n [9] 重置 PortSentinel 规则\n\n [u] 一键更新\n [0] 退出\n\n'
+        printf ' [1] 受保护端口\n [2] IP Group 管理\n [3] 添加端口保护\n [4] 删除规则\n [5] 查看有效规则\n [6] 应用配置\n [7] 备份 / 恢复\n [8] 防火墙状态\n [9] 重置 PortSentinel 规则\n\n [u] 一键更新\n [0] 退出\n\n'
         local choice; read -r -p '> ' choice
         case "$choice" in
             1) protected_ports_menu;; 2) groups_menu;; 3) add_rule;; 4) delete_rule;;
