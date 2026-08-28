@@ -10,9 +10,9 @@ UPDATE_MODE=0
 [[ "${1:-}" == --update ]] && UPDATE_MODE=1
 
 info() { printf '[PortSentinel] %s\n' "$*"; }
-die() { printf '[PortSentinel] ERROR: %s\n' "$*" >&2; exit 1; }
+die() { printf '[PortSentinel] 错误：%s\n' "$*" >&2; exit 1; }
 
-[[ "${EUID}" -eq 0 ]] || die "Run this installer as root."
+[[ "${EUID}" -eq 0 ]] || die "请使用 root 权限运行安装程序。"
 
 packages=()
 command -v curl >/dev/null 2>&1 || packages+=(curl)
@@ -25,8 +25,8 @@ command -v jq >/dev/null 2>&1 || packages+=(jq)
 command -v python3 >/dev/null 2>&1 || packages+=(python3)
 
 if (( ${#packages[@]} )); then
-    command -v apt-get >/dev/null 2>&1 || die "Missing dependencies: ${packages[*]}. Automatic installation supports Debian/Ubuntu apt."
-    info "Installing required packages: ${packages[*]}"
+    command -v apt-get >/dev/null 2>&1 || die "缺少依赖：${packages[*]}。自动安装仅支持 Debian/Ubuntu 的 apt。"
+    info "正在安装依赖：${packages[*]}"
     export DEBIAN_FRONTEND=noninteractive
     apt-get update
     apt-get install -y --no-install-recommends "${packages[@]}"
@@ -50,8 +50,8 @@ fetch systemd/portsentinel.service "$stage/portsentinel.service"
 fetch uninstall.sh "$stage/uninstall.sh"
 bash -n "$stage/portsentinel"
 bash -n "$stage/uninstall.sh"
-grep -q '^Description=PortSentinel' "$stage/portsentinel.service" || die "Invalid systemd service file."
-grep -q 'readonly VERSION=' "$stage/portsentinel" || die "Invalid PortSentinel executable."
+grep -q '^Description=PortSentinel' "$stage/portsentinel.service" || die "systemd 服务文件无效。"
+grep -q 'readonly VERSION=' "$stage/portsentinel" || die "PortSentinel 程序文件无效。"
 
 install -d -m 700 /etc/portsentinel /etc/portsentinel/backups
 chown root:root /etc/portsentinel /etc/portsentinel/backups
@@ -76,8 +76,8 @@ if command -v systemctl >/dev/null 2>&1; then
 fi
 
 if (( UPDATE_MODE )); then
-    info "Update complete: $(/usr/local/bin/portsentinel version)"
+    info "更新完成：$(/usr/local/bin/portsentinel version)"
 else
-    info "Installation complete. No firewall rules were changed."
-    info "Run 'sudo portsentinel' to create a policy, review the dry run, and apply it."
+    info "安装完成，未修改任何防火墙规则。"
+    info "运行 'sudo portsentinel' 创建策略，先检查 Dry Run，再主动应用。"
 fi
