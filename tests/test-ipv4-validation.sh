@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# shellcheck source=test-helper.sh
+# shellcheck disable=SC1091 # Runtime-relative test helper.
 source "$(dirname "$0")/test-helper.sh"
 
 assert_success 'IPv4 address' validate_address 192.0.2.1 4

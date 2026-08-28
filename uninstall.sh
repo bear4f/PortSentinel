@@ -34,7 +34,7 @@ if command -v systemctl >/dev/null 2>&1; then
 fi
 rm -f -- /etc/systemd/system/portsentinel.service /usr/local/bin/portsentinel
 rm -rf -- /usr/local/lib/portsentinel
-command -v systemctl >/dev/null 2>&1 && systemctl daemon-reload || true
+if command -v systemctl >/dev/null 2>&1; then systemctl daemon-reload || true; fi
 
 keep=yes
 if [[ -t 0 ]]; then

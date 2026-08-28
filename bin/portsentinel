@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC2016 # Single-quoted jq programs intentionally use jq variables.
 set -Eeuo pipefail
 umask 077
 
@@ -376,7 +377,7 @@ rotate_backups() {
     for file in "$BACKUP_DIR"/*.ipv4.rules; do sets+=("$file"); done
     shopt -u nullglob
     if (( ${#sets[@]} <= BACKUP_KEEP )); then return; fi
-    IFS=$'\n' sets=($(printf '%s\n' "${sets[@]}" | sort)); unset IFS
+    mapfile -t sets < <(printf '%s\n' "${sets[@]}" | sort)
     local remove_count=$(( ${#sets[@]} - BACKUP_KEEP )) i
     for ((i=0; i<remove_count; i++)); do
         file="${sets[$i]}"; stamp="${file%.ipv4.rules}"
@@ -473,9 +474,9 @@ ssh_source_allowed() {
 ssh_lockout_check() {
     local source source_port server_port extra family
     if [[ -n "${SSH_CONNECTION:-}" ]]; then
-        read -r source source_port _ server_port extra <<<"$SSH_CONNECTION"
+        read -r source _ _ server_port extra <<<"$SSH_CONNECTION"
     elif [[ -n "${SSH_CLIENT:-}" ]]; then
-        read -r source source_port server_port extra <<<"$SSH_CLIENT"
+        read -r source _ server_port extra <<<"$SSH_CLIENT"
     else
         return 0
     fi
@@ -937,7 +938,7 @@ tui() {
         case "$choice" in
             1) protected_ports_menu;; 2) groups_menu;; 3) add_rule;; 4) delete_rule;;
             5) effective_rules_cmd;; 6) apply_cmd;;
-            7) printf '[1] Backup [2] Restore\n'; read -r -p '> ' choice; [[ "$choice" == 1 ]] && backup_cmd || restore_cmd;;
+            7) printf '[1] Backup [2] Restore\n'; read -r -p '> ' choice; if [[ "$choice" == 1 ]]; then backup_cmd; else restore_cmd; fi;;
             8) status_cmd;; 9) reset_cmd;; u|U) update_cmd;; 0) return;; *) warn "Invalid choice.";;
         esac
         read -r -p 'Press Enter to continue...' _ || true

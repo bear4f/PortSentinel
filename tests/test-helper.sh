@@ -13,7 +13,7 @@ export PORTSENTINEL_LOCK_FILE="$TEST_ROOT/portsentinel.lock"
 export PORTSENTINEL_LIB_ONLY=1
 mkdir -p "$PORTSENTINEL_CONFIG_DIR" "$PORTSENTINEL_BACKUP_DIR"
 
-# shellcheck source=../bin/portsentinel
+# shellcheck disable=SC1091 # Path is resolved from this test helper at runtime.
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/bin/portsentinel"
 
 pass_count=0

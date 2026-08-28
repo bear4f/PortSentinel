@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# shellcheck source=test-helper.sh
+# shellcheck disable=SC1091,SC2034 # Sourced functions consume these shared globals.
 source "$(dirname "$0")/test-helper.sh"
 
 cat >"$CONFIG_FILE" <<'JSON'
