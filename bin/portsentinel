@@ -472,7 +472,7 @@ ssh_source_allowed() {
 }
 
 ssh_lockout_check() {
-    local source source_port server_port extra family
+    local source server_port extra family
     if [[ -n "${SSH_CONNECTION:-}" ]]; then
         read -r source _ _ server_port extra <<<"$SSH_CONNECTION"
     elif [[ -n "${SSH_CLIENT:-}" ]]; then
