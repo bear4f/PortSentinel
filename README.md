@@ -1,31 +1,26 @@
 # PortSentinel
 
-PortSentinel is an interactive Linux dual-stack port whitelist manager. It restricts access to selected local TCP and UDP ports with ordinary `iptables` and `ip6tables` rules. An address is allowed only when it appears directly in a rule or in an attached IP group; other traffic for that protected port is dropped.
+PortSentinel 是一个面向 Linux 服务器的交互式双栈端口白名单管理工具。它通过标准的 `iptables` 和 `ip6tables` 规则限制指定的本机 TCP/UDP 端口：只有明确加入规则或 IP Group 的 IPv4、IPv6 地址及 CIDR 网络可以访问，其他来源将被丢弃。
 
-PortSentinel does **not** hide traffic from network operators, provide anonymity, bypass filtering, inspect application protocols, or modify NAT, `FORWARD`, `OUTPUT`, `PREROUTING`, or `POSTROUTING`.
+PortSentinel 只负责常规防火墙访问控制。它不会隐藏流量、提供匿名能力、绕过网络审查、识别应用层协议，也不会修改 NAT、`FORWARD`、`OUTPUT`、`PREROUTING` 或 `POSTROUTING`。
 
-## Features
+> PortSentinel restricts access to selected network ports using normal Linux firewall rules. It does not hide traffic from network operators and does not provide anonymity.
 
-- IPv4 and IPv6 policies are generated and applied together.
-- Single ports and inclusive ranges from `1` through `65535`.
-- TCP, UDP, or TCP+UDP rules.
-- Strict IPv4, IPv6, and CIDR validation through Python's `ipaddress` module.
-- Reusable IP groups shared by any number of protected ports.
-- Private `PORTSENTINEL` chains; no global firewall flushes.
-- Staging-chain policy changes and paired rollback backups.
-- SSH lockout warning based on `SSH_CONNECTION`/`SSH_CLIENT`, including non-standard SSH ports.
-- Idempotent apply, `flock` serialization, `iptables -w 5`, dry run, systemd persistence, and one-command updates.
-- Compatible with the normal `iptables` interface backed by either xtables or nftables.
+## 一键安装
 
-## Compatibility
+支持 Debian 12/13、Ubuntu 22.04/24.04，兼容 amd64 和 arm64：
 
-The supported targets are Debian 12/13 and Ubuntu 22.04/24.04 on amd64 and arm64. PortSentinel is a shell program and has no architecture-specific binary. It uses the distribution's existing `iptables` alternative; it never forces `iptables-legacy`.
+```bash
+curl -fsSL https://raw.githubusercontent.com/bear4f/PortSentinel/main/install.sh | sudo bash
+```
 
-Required tools are Bash, `iptables`, `ip6tables`, `ip`, `ss`, `flock`, `jq`, and Python 3. The installer obtains missing packages with `apt`.
+安装程序只会安装程序文件、依赖和 systemd 服务，**不会立即添加 DROP 规则或修改现有防火墙策略**。安装完成后运行：
 
-## Installation
+```bash
+sudo portsentinel
+```
 
-Review the installer before running it, then install from the default branch:
+建议先检查安装脚本再执行：
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/bear4f/PortSentinel/main/install.sh -o install-portsentinel.sh
@@ -33,13 +28,59 @@ less install-portsentinel.sh
 sudo bash install-portsentinel.sh
 ```
 
-For a local checkout:
+## 主要功能
+
+- 同时生成并应用 IPv4 和 IPv6 策略，防止 IPv6 绕过。
+- 支持 `1-65535` 的单端口和端口范围。
+- 支持 TCP、UDP 和 TCP+UDP。
+- 使用 Python `ipaddress` 严格验证 IPv4、IPv6 和 CIDR。
+- 支持可被多个端口复用的 IP Group。
+- 仅管理独立的 `PORTSENTINEL` 链，不清空系统防火墙。
+- 使用临时链安全切换策略，失败时执行双栈成对回滚。
+- 根据 `SSH_CONNECTION`、`SSH_CLIENT` 和 `ss -lntp` 防止 SSH 锁死。
+- 支持幂等 Apply、`flock` 并发锁、`iptables -w 5`、Dry Run 和 systemd 持久化。
+- 提供 TUI 更新按键和 `portsentinel update` 一键更新命令。
+- 兼容 xtables 和 nftables 后端的标准 `iptables` 命令接口。
+
+## 快速开始
 
 ```bash
-sudo PORTSENTINEL_SOURCE_DIR="$PWD" bash install.sh
+# 打开交互式管理菜单
+sudo portsentinel
+
+# 只预览 IPv4/IPv6 规则，不修改防火墙
+sudo portsentinel apply --dry-run
+
+# 应用配置
+sudo portsentinel apply
+
+# 查看状态
+sudo portsentinel status
 ```
 
-Installation creates:
+交互式菜单支持：
+
+- 添加、编辑和删除受保护端口。
+- 添加 IPv4、IPv6 地址和 CIDR。
+- 创建、重命名、删除和复用 IP Group。
+- 查看展开后的有效规则和流量计数。
+- 创建或恢复双栈防火墙备份。
+- 重置 PortSentinel 私有规则。
+- 一键更新 PortSentinel。
+
+## 系统兼容性与依赖
+
+重点支持：
+
+- Debian 12 / 13
+- Ubuntu 22.04 / 24.04
+- amd64 / arm64
+
+依赖包括 Bash、`iptables`、`ip6tables`、`ip`、`ss`、`flock`、`jq` 和 Python 3。安装程序会通过 `apt` 安装缺少的软件包，不会强制切换到 `iptables-legacy`。
+
+## 安装内容
+
+安装后会创建：
 
 - `/usr/local/bin/portsentinel`
 - `/usr/local/lib/portsentinel/uninstall.sh`
@@ -47,26 +88,26 @@ Installation creates:
 - `/etc/portsentinel/portsentinel.conf`
 - `/etc/portsentinel/backups/`
 - `/etc/systemd/system/portsentinel.service`
-- `/var/log/portsentinel.log` after the first loggable operation
+- `/var/log/portsentinel.log`（首次记录日志时创建）
 
-The installer enables the service for future boots, but does not start it and does not add any firewall rule. Firewall changes happen only after a valid non-empty policy is explicitly applied.
-
-## Quick start
+使用本地仓库安装：
 
 ```bash
-sudo portsentinel
-sudo portsentinel apply --dry-run
-sudo portsentinel apply
-sudo portsentinel status
+sudo PORTSENTINEL_SOURCE_DIR="$PWD" bash install.sh
 ```
 
-The menu can create an IP group, add IPv4/IPv6 addresses or CIDRs, create a protected-port rule, show the expanded policy, create backups, restore a pair, reset private rules, or update PortSentinel.
+## 配置模型
 
-## Configuration model
+示例配置位于 [`examples/config.example.json`](examples/config.example.json)。每条规则包含：
 
-See [`examples/config.example.json`](examples/config.example.json). A rule contains a unique name, `tcp`, `udp`, or `both`, a port such as `10773` or `20000:20100`, attached groups, direct sources for each family, and a separate default for IPv4 and IPv6.
+- 唯一的规则名称。
+- `tcp`、`udp` 或 `both` 协议。
+- 单端口（如 `10773`）或范围（如 `20000:20100`）。
+- 可复用的 IP Group。
+- IPv4 和 IPv6 自定义来源。
+- IPv4 和 IPv6 各自独立的默认策略。
 
-Valid source examples:
+支持的地址格式：
 
 ```text
 IPv4:      192.0.2.10
@@ -75,52 +116,69 @@ IPv6:      2001:db8::10
 IPv6 CIDR: 2001:db8:1234::/48
 ```
 
-IPv4 prefixes from `/0` through `/32` and IPv6 prefixes from `/0` through `/128` are supported. IPv4 values never reach `ip6tables`, and IPv6 values never reach `iptables`. Invalid values, duplicate names, missing groups, duplicate addresses, invalid ports, and overlapping protected port/protocol combinations are rejected before firewall access.
+IPv4 支持 `/0` 到 `/32`，IPv6 支持 `/0` 到 `/128`。IPv4 地址只会进入 `iptables`，IPv6 地址只会进入 `ip6tables`。无效地址、重复名称、缺失 Group、重复来源、无效端口以及协议和端口范围重叠都会在接触防火墙前被拒绝。
 
-An IP group may contain both families and be attached to many ports. Adding an address to that group changes the effective policy for every attached rule on the next apply. Deleting a referenced group requires an explicit warning confirmation and detaches it from rules.
+一个 IP Group 可以同时保存 IPv4 和 IPv6 来源，并绑定到任意数量的受保护端口。修改 Group 后，所有引用该 Group 的端口会在下次 Apply 时自动继承新地址。
 
-### Empty IPv6 whitelist
+### IPv6 空白名单保护
 
-Every protected-port rule has an explicit `ipv6_default`. The interactive default is `drop`. Therefore a TCP/10773 rule with an IPv4 whitelist and no IPv6 sources still generates this IPv6 policy:
+每个受保护端口都有明确的 `ipv6_default`，交互式创建规则时默认使用 `drop`。因此，即使 TCP/10773 只有 IPv4 白名单而没有 IPv6 来源，仍会生成：
 
 ```text
 ip6tables ... -A PORTSENTINEL_NEW -p tcp --dport 10773 -j DROP
 ```
 
-This prevents an accidental IPv6 bypass. Choosing unrestricted access is deliberate and produces an explicit per-port `RETURN` rule.
+这样可以避免端口在 IPv4 已受保护时仍通过 IPv6 暴露。只有用户主动选择“保持不限制”时，才会为该端口生成明确的 `RETURN`。
 
-## Firewall architecture
+## 防火墙架构
 
-PortSentinel owns exactly one `PORTSENTINEL` chain in the IPv4 filter table and one in the IPv6 filter table. Each `INPUT` chain has one corresponding jump. Allowed sources receive `ACCEPT`, non-whitelisted traffic to a protected port receives `DROP`, and the private chain ends with `RETURN` so unrelated local ports continue through the host's existing firewall.
+PortSentinel 在 IPv4 和 IPv6 的 filter 表中分别维护一个 `PORTSENTINEL` 链，并在各自的 `INPUT` 链中保留一个 jump：
 
-PortSentinel never runs `iptables -F`, `iptables -X`, `ip6tables -F`, or `ip6tables -X` without a private chain name. Docker, Fail2ban, UFW, SSH, and user rules are left in place. The execution position is the first rule in `INPUT`; PortSentinel protects only services terminating on this host.
+```text
+iptables:  INPUT -> PORTSENTINEL
+ip6tables: INPUT -> PORTSENTINEL
+```
 
-### Transactional apply and rollback
+白名单来源使用 `ACCEPT`，受保护端口的其他来源使用 `DROP`，私有链最后使用 `RETURN`，让未被 PortSentinel 管理的端口继续执行服务器原有防火墙规则。
 
-`portsentinel apply` performs these steps under `/run/portsentinel.lock`:
+PortSentinel 不会对内置链执行无目标的 `iptables -F`、`iptables -X`、`ip6tables -F` 或 `ip6tables -X`。Docker、Fail2ban、UFW、SSH 和用户自定义规则会被保留。第一版只管理进入本机服务的 `INPUT` 流量。
 
-1. Validate the complete JSON schema, addresses, ports, group references, and overlaps.
-2. Generate complete IPv4 and IPv6 candidates.
-3. Verify required backends before changing either family.
-4. Save paired full-firewall backups with one UTC timestamp.
-5. Build a complete `PORTSENTINEL_NEW` chain for IPv4.
-6. Replace the existing `INPUT` jump with the staging jump, remove the unreferenced old private chain, and rename staging to `PORTSENTINEL`.
-7. Repeat the switch for IPv6.
-8. If either family fails or the process receives `INT`/`TERM` mid-transaction, restore both saved rulesets with `iptables-restore` and `ip6tables-restore`.
+## 双栈事务 Apply 与回滚
 
-The staging chain is complete before it becomes reachable, so repeated applies are idempotent and do not accumulate jumps or rules. A whole-firewall restore is used only for rollback or an explicit restore—not during a normal apply.
+`portsentinel apply` 会在 `/run/portsentinel.lock` 锁内完成：
 
-If Linux reports IPv6 completely disabled, PortSentinel stores and validates the IPv6 policy, reports `IPv6: Disabled by system`, and skips the unavailable family without discarding the IPv4 policy. If IPv6 is enabled but its backend is missing or fails, preflight or rollback prevents a half-applied policy.
+1. 验证完整 JSON 结构、地址、端口、Group 引用和范围重叠。
+2. 生成完整的 IPv4 和 IPv6 候选策略。
+3. 在修改任何一侧前检查所需后端。
+4. 使用同一个 UTC 时间戳保存 IPv4/IPv6 成对备份。
+5. 分别构建完整的 `PORTSENTINEL_NEW` 临时链。
+6. 将 `INPUT` jump 切换到新链，删除不再引用的旧私有链。
+7. 把临时链重命名为正式的 `PORTSENTINEL`。
+8. 任意一侧失败或进程收到 `INT`/`TERM` 时，用 `iptables-restore` 和 `ip6tables-restore` 同时恢复两套备份。
 
-## SSH lockout protection
+候选链在被引用前已经完整构建，因此重复执行 Apply 不会产生重复 jump 或重复规则。完整防火墙 restore 只用于失败回滚或用户主动恢复备份，正常 Apply 不会重建系统其他规则。
 
-Before an interactive apply, PortSentinel parses the current client address and actual destination port from `SSH_CONNECTION` or `SSH_CLIENT`, then checks the listener with `ss -lntp` when available. It does not assume port 22. If a new TCP rule covers that port and its effective source networks do not contain the current client, PortSentinel displays a critical warning and cancels by default. Continuing without an exception requires typing the exact phrase `APPLY ANYWAY`.
+如果系统完全禁用了 IPv6，PortSentinel 仍会保存并验证 IPv6 策略，同时明确显示 `IPv6: Disabled by system`。如果系统已启用 IPv6 但后端缺失或执行失败，预检查或 rollback 会阻止双栈策略处于半应用状态。
 
-Typing `PRESERVE CURRENT SSH` or passing `--preserve-current-ssh` adds the current source to the generated candidate for that protected TCP port only. It does not change `config.json`; therefore it lasts until the next apply. Non-interactive apply refuses a detected unsafe SSH session unless that explicit flag is present.
+## SSH 防锁死
 
-Also verify listening ports yourself with `ss -lntp` before protecting remote administration. Keep an independent rescue console available when changing any firewall.
+交互式 Apply 前，PortSentinel 会从 `SSH_CONNECTION` 或 `SSH_CLIENT` 获取当前客户端地址和服务器实际端口，并在可用时通过 `ss -lntp` 检查监听状态，不会假定 SSH 使用 22 端口。
 
-## Dry run and inspection
+如果新规则覆盖当前 SSH 端口，但白名单不包含当前来源，程序会显示严重警告并默认取消。继续执行需要输入完整字符串：
+
+```text
+APPLY ANYWAY
+```
+
+也可以输入 `PRESERVE CURRENT SSH`，或运行：
+
+```bash
+sudo portsentinel apply --preserve-current-ssh
+```
+
+这会把当前 SSH 来源临时加入本次生成的候选规则，但不会修改 `config.json`，所以下一次 Apply 前仍应把管理地址正式加入白名单。修改任何远程服务器防火墙前，建议保留独立的救援控制台。
+
+## Dry Run 与规则检查
 
 ```bash
 sudo portsentinel apply --dry-run
@@ -129,62 +187,74 @@ sudo portsentinel list
 sudo portsentinel group list
 ```
 
-Dry run validates the configuration and prints separate `===== IPv4 =====` and `===== IPv6 =====` candidate commands. It does not require root and does not touch firewall state. `effective` expands group membership and, when run as root with active chains, also displays packet and byte counters.
+Dry Run 会验证配置并分别打印 `===== IPv4 =====` 和 `===== IPv6 =====` 候选命令，不需要 root 权限，也不会修改防火墙。`effective` 会展开 Group；以 root 运行且规则已激活时，还会显示 packet/byte 计数。
 
-## Backup and restore
+## 备份与恢复
 
-Every real apply creates a pair such as:
+每次真实 Apply 都会创建一组成对备份：
 
 ```text
 /etc/portsentinel/backups/20260829-003000.ipv4.rules
 /etc/portsentinel/backups/20260829-003000.ipv6.rules
 ```
 
-The newest 20 pairs are retained by default. Create or restore explicitly with:
+默认保留最近 20 组：
 
 ```bash
 sudo portsentinel backup
 sudo portsentinel restore 20260829-003000
 ```
 
-Restore first creates a safety backup. If either restore command fails, PortSentinel attempts to reinstate that safety pair.
+Restore 前还会创建一组安全备份。如果 IPv4 或 IPv6 恢复失败，程序会尝试重新恢复该安全备份。
 
-## Persistence
+## 开机自动恢复
 
-`portsentinel.service` is a `Type=oneshot` unit ordered after local filesystems and before `network-pre.target`. It pulls in that passive target, following systemd's documented ordering for firewall services, without waiting for `network-online.target`. It runs `portsentinel apply --non-interactive`; it does not depend on `iptables-persistent`. A missing or empty configuration causes a clean no-op, while errors are visible in the journal and `/var/log/portsentinel.log` where writable.
+`portsentinel.service` 是一个 `Type=oneshot` 服务，在本地文件系统就绪后、`network-pre.target` 之前运行：
+
+```text
+/usr/local/bin/portsentinel apply --non-interactive
+```
+
+它不依赖 `iptables-persistent`，也不会等待 `network-online.target`。配置不存在或没有受保护端口时会安全退出；错误可以通过以下命令查看：
 
 ```bash
 sudo systemctl status portsentinel
 sudo journalctl -u portsentinel
 ```
 
-## Update
+## 一键更新
 
-Choose `[u] Update` in the interactive menu or run:
+在交互式菜单中选择 `[u] Update`，或者运行：
 
 ```bash
 sudo portsentinel update
 ```
 
-The command downloads the HTTPS installer to a temporary file, validates its Bash syntax and PortSentinel marker, and then runs its update mode. The update replaces only program/service files, preserves configuration and backups, reloads systemd metadata, and does not apply or restart the firewall policy automatically.
+更新功能会通过 HTTPS 下载最新安装程序，先检查 Bash 语法和 PortSentinel 标记，再运行更新模式。它只替换程序和 service 文件，保留配置与备份，重新加载 systemd 元数据，但不会自动重新 Apply 或重启当前防火墙策略。
 
-## Reset and uninstall
+也可以直接重新执行一键安装命令完成更新：
 
-Reset removes only `INPUT -> PORTSENTINEL` jumps and PortSentinel's private chains. It keeps the program, configuration, and backups:
+```bash
+curl -fsSL https://raw.githubusercontent.com/bear4f/PortSentinel/main/install.sh | sudo bash -s -- --update
+```
+
+## Reset 与卸载
+
+Reset 只删除 `INPUT -> PORTSENTINEL` jump 和 PortSentinel 私有链，保留程序、配置和备份：
 
 ```bash
 sudo portsentinel reset
 ```
 
-Uninstall requires a second confirmation, disables the service, removes the same private rules and installed files, then asks whether `/etc/portsentinel` should be kept. The default is to retain it:
+卸载会要求二次确认，停止并禁用 service，删除 PortSentinel 私有规则和程序文件，然后询问是否保留 `/etc/portsentinel`。默认保留配置和备份：
 
 ```bash
 sudo portsentinel uninstall
 ```
 
-Neither operation flushes an entire built-in chain.
+Reset 和卸载都不会清空完整的系统内置链。
 
-## CLI reference
+## CLI 命令
 
 ```text
 portsentinel
@@ -193,7 +263,7 @@ portsentinel list
 portsentinel rule list
 portsentinel group list
 portsentinel effective
-portsentinel apply [--dry-run] [--non-interactive]
+portsentinel apply [--dry-run] [--non-interactive] [--preserve-current-ssh]
 portsentinel backup
 portsentinel restore [TIMESTAMP]
 portsentinel reset [--non-interactive]
@@ -202,25 +272,32 @@ portsentinel uninstall
 portsentinel version
 ```
 
-## Testing
+## 测试
 
-The default suite uses temporary configuration and dry-run/fake backends; it never modifies the host `INPUT` chain:
+默认测试使用临时配置、Dry Run 和模拟防火墙后端，不会修改宿主机 `INPUT`：
 
 ```bash
 bash tests/run-tests.sh
 ```
 
-CI runs Bash syntax checks, ShellCheck, strict address/port/config tests, group expansion, TCP/UDP/TCP+UDP generation, duplicate prevention, the empty-IPv6-list regression, and an idempotent fake-backend apply. A real network-namespace integration test is available only when explicitly enabled on Linux with root:
+CI 会执行 Bash 语法检查、ShellCheck、严格地址/端口/配置测试、Group 展开、TCP/UDP/TCP+UDP 生成、重复规则防护、IPv6 空白名单回归测试、幂等 Apply 和双栈 rollback 测试。
+
+在 Linux root 环境中可以显式运行真实 network namespace 测试：
 
 ```bash
 sudo PORTSENTINEL_RUN_NETNS=1 bash tests/test-netns.sh
 ```
 
-## Security model and limitations
+## 安全模型与限制
 
-PortSentinel is a local `INPUT` access-control tool, not a complete firewall policy manager. An earlier host rule that accepts traffic before the PortSentinel jump, rules installed by another component later, or traffic not traversing local `INPUT` can change the result. Review `iptables -S INPUT` and `ip6tables -S INPUT` after deployment.
+PortSentinel 是本机 `INPUT` 访问控制工具，不是完整的系统防火墙管理器。位于 PortSentinel jump 前方的其他 ACCEPT 规则、其他组件后续添加的规则，或不经过本机 `INPUT` 的流量都可能改变最终结果。部署后请检查：
 
-Configuration is root-owned (`0700` directory, `0600` JSON and backups). Inputs are passed as validated command arguments rather than evaluated shell text. Logs contain operation metadata, not credentials or secrets.
+```bash
+sudo iptables -S INPUT
+sudo ip6tables -S INPUT
+```
+
+配置目录由 root 所有，目录权限为 `0700`，JSON 和备份权限为 `0600`。所有地址和端口在作为命令参数前都会经过严格验证，日志只保存操作结果，不记录密码、私钥、Token 或其他凭证。
 
 ## License
 
