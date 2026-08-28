@@ -15,6 +15,7 @@ tests=(
   test-chinese-tui.sh
   test-add-rule-flow.sh
   test-tui-input-retry.sh
+  test-ip-group-batch.sh
   test-ssh-protection.sh
   test-dry-run.sh
   test-apply-idempotent.sh
