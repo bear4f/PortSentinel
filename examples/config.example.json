@@ -1,0 +1,29 @@
+{
+  "version": 1,
+  "groups": {
+    "relay": {
+      "ipv4": [
+        "192.0.2.10",
+        "198.51.100.0/24"
+      ],
+      "ipv6": [
+        "2001:db8::10",
+        "2001:db8:1234::/48"
+      ]
+    }
+  },
+  "rules": [
+    {
+      "name": "Example service",
+      "protocol": "tcp",
+      "port": "10773",
+      "groups": ["relay"],
+      "sources": {
+        "ipv4": [],
+        "ipv6": []
+      },
+      "ipv4_default": "drop",
+      "ipv6_default": "drop"
+    }
+  ]
+}
