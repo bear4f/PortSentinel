@@ -19,8 +19,9 @@ EOF
 )"
 
 assert_contains 'invalid port stays in current step' "$direct_output" '端口无效，请重新输入'
-assert_contains 'invalid protocol stays in current step' "$direct_output" '协议选项无效，请重新选择'
-assert_contains 'invalid source choice stays in current step' "$direct_output" '白名单来源选项无效，请重新选择'
+assert_contains 'invalid protocol stays in current step' "$direct_output" '无效选项，请重新选择'
+assert_contains 'numbered protocol picker is shown' "$direct_output" '[3] TCP + UDP'
+assert_contains 'numbered source picker is shown' "$direct_output" '[2] 绑定已有 IP Group'
 assert_contains 'empty direct source stays in current step' "$direct_output" 'IP/CIDR 不能为空，请重新输入'
 assert_contains 'invalid direct source stays in current step' "$direct_output" 'IP/CIDR 无效：not-an-ip'
 assert_contains 'direct source detects address families' "$direct_output" '已识别 IPv4 2 个、IPv6 1 个来源'

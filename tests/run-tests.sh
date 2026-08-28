@@ -17,6 +17,7 @@ tests=(
   test-tui-input-retry.sh
   test-ip-group-batch.sh
   test-ssh-protection.sh
+  test-backup-restore.sh
   test-dry-run.sh
   test-apply-idempotent.sh
   test-rollback.sh
