@@ -8,6 +8,8 @@ config_edit test-rule '.rules = [{name:"Snell",protocol:"both",port:"10086",grou
 retry_output="$(add_rule_source 2>&1 <<'INPUT'
 wrong
 1
+9
+1
 
 not-an-ip
 8.212.49.31, 2001:db8::5
@@ -15,6 +17,8 @@ INPUT
 )"
 
 assert_contains 'invalid rule ID is retried' "$retry_output" '规则 ID 无效，请输入 1-1'
+assert_contains 'source kind picker offers both direct input and groups' "$retry_output" '[2] 绑定已有 IP Group'
+assert_contains 'invalid source kind is retried' "$retry_output" '无效选项，请重新选择'
 assert_contains 'rule picker lists rules' "$retry_output" '[1] Snell  ·  TCP+UDP/10086'
 assert_contains 'empty address is retried' "$retry_output" 'IP/CIDR 或域名不能为空，请重新输入'
 assert_contains 'invalid address is retried' "$retry_output" 'IP/CIDR 或域名无效：not-an-ip'
@@ -24,10 +28,12 @@ assert_success 'valid addresses are stored after retries' jq -e '.rules[0].sourc
 
 remove_output="$(remove_rule_source 2>&1 <<'INPUT'
 1
+1
 2001:db8::5
 INPUT
 )"
 assert_contains 'removal shows the current sources' "$remove_output" '  IPv4：8.212.49.31'
+assert_contains 'removal lists bound groups too' "$remove_output" '  IP Group：未绑定'
 assert_success 'removed source is dropped' jq -e '.rules[0].sources.ipv6 == []' "$CONFIG_FILE"
 
 list_output="$(list_rules)"
@@ -39,10 +45,34 @@ assert_contains 'rule list explains IPv6 policy' "$list_output" 'IPv6：直接�
 # q 可以在任何输入步骤放弃当前操作，菜单会给出明确提示而不是错误。
 cancel_file="$TEST_ROOT/cancel.txt"
 run_tui_action add_rule_source >"$cancel_file" 2>&1 <<'INPUT'
+1
 q
 INPUT
 assert_contains 'q cancels the current action' "$(<"$cancel_file")" '已放弃当前操作，返回菜单'
 assert_success 'cancelling changes nothing' jq -e '.rules[0].sources.ipv4 == ["8.212.49.31"]' "$CONFIG_FILE"
+
+# 同一个入口里也可以绑定 / 解绑 IP Group，不必再去单独的菜单项。
+config_edit test-group '.groups.office = {ipv4:["198.51.100.10"],ipv6:[],domains:[]}'
+group_output="$(add_rule_source 2>&1 <<'INPUT'
+1
+2
+missing
+office
+INPUT
+)"
+assert_contains 'unknown group stays in the current step' "$group_output" '找不到 IP Group：missing'
+assert_contains 'binding a group is reported' "$group_output" '已绑定 IP Group：office'
+assert_success 'group binding is stored on the rule' jq -e '.rules[0].groups == ["office"]' "$CONFIG_FILE"
+
+unbind_output="$(remove_rule_source 2>&1 <<'INPUT'
+1
+2
+nope
+office
+INPUT
+)"
+assert_contains 'unbinding rejects groups the rule does not use' "$unbind_output" '该规则未绑定：nope'
+assert_success 'group is detached from the rule' jq -e '.rules[0].groups == []' "$CONFIG_FILE"
 
 failing_tui_action() { die "模拟操作失败。"; }
 guard_output_file="$TEST_ROOT/tui-guard.txt"

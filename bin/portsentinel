@@ -3,7 +3,7 @@
 set -Eeuo pipefail
 umask 077
 
-readonly VERSION="1.4.0"
+readonly VERSION="1.4.1"
 readonly CHAIN="PORTSENTINEL"
 readonly STAGE_CHAIN="PORTSENTINEL_NEW"
 readonly OLD_CHAIN="PORTSENTINEL_OLD"
@@ -1524,7 +1524,8 @@ show_rule_sources() {
     jq -r --argjson i "$1" '.rules[$i] |
       "  IPv4：" + (if (.sources.ipv4|length) == 0 then "无" else (.sources.ipv4|join("、")) end),
       "  IPv6：" + (if (.sources.ipv6|length) == 0 then "无" else (.sources.ipv6|join("、")) end),
-      "  域名：" + (if ((.sources.domains // [])|length) == 0 then "无" else ((.sources.domains // [])|join("、")) end)' "$CONFIG_FILE"
+      "  域名：" + (if ((.sources.domains // [])|length) == 0 then "无" else ((.sources.domains // [])|join("、")) end),
+      "  IP Group：" + (if (.groups|length) == 0 then "未绑定" else (.groups|join("、")) end)' "$CONFIG_FILE"
 }
 
 edit_rule() {
@@ -1563,66 +1564,115 @@ edit_rule() {
     info "规则已更新。请返回主菜单选择 [2] 应用配置。"
 }
 
+# 规则的白名单来源分两类：直接写 IP/CIDR/域名，或者绑定 IP Group。
+# 两者放在同一个入口里选择，避免"添加白名单"里找不到 Group。
 add_rule_source() {
-    local index="" v4_addresses='[]' v6_addresses='[]' domain_list='[]'
+    local index="" source_kind="" status=0
+    local v4_addresses='[]' v6_addresses='[]' domain_list='[]' group_json='[]'
     ui_hint
     read_rule_index index || return $?
-    prompt_mixed_sources v4_addresses v6_addresses domain_list \
-      '请输入要加入白名单的 IP/CIDR 或域名（多个用逗号分隔）：' || return $?
+    show_rule_sources "$index"
+    while true; do
+        prompt_select source_kind '请选择要添加的来源类型：' \
+          'direct:直接输入 IP/CIDR 或域名' 'group:绑定已有 IP Group' || return "$PROMPT_CANCEL"
+        status=0
+        case "$source_kind" in
+            direct)
+                prompt_mixed_sources v4_addresses v6_addresses domain_list \
+                  '请输入要加入白名单的 IP/CIDR 或域名（多个用逗号分隔）：' || status=$?
+                ;;
+            group)
+                prompt_rule_groups group_json || status=$?
+                ;;
+        esac
+        if (( status == PROMPT_CANCEL )); then return "$PROMPT_CANCEL"; fi
+        if (( status == 0 )); then break; fi
+    done
     config_edit rule-source-add --argjson i "$index" --argjson v4 "$v4_addresses" \
-      --argjson v6 "$v6_addresses" --argjson domains "$domain_list" \
+      --argjson v6 "$v6_addresses" --argjson domains "$domain_list" --argjson groups "$group_json" \
       '.rules[$i].sources.ipv4 = ((.rules[$i].sources.ipv4 + $v4) | unique) |
        .rules[$i].sources.ipv6 = ((.rules[$i].sources.ipv6 + $v6) | unique) |
-       .rules[$i].sources.domains = (((.rules[$i].sources.domains // []) + $domains) | unique)'
-    info "来源已添加。请返回主菜单选择 [2] 应用配置。"
+       .rules[$i].sources.domains = (((.rules[$i].sources.domains // []) + $domains) | unique) |
+       .rules[$i].groups = ((.rules[$i].groups + $groups) | unique)'
+    if [[ "$source_kind" == group ]]; then
+        info "已绑定 IP Group：$(jq -r 'join("、")' <<<"$group_json")。请返回主菜单选择 [2] 应用配置。"
+    else
+        info "来源已添加。请返回主菜单选择 [2] 应用配置。"
+    fi
 }
 
 remove_rule_source() {
-    local index="" v4_addresses='[]' v6_addresses='[]' domain_list='[]'
+    local index="" source_kind="" status=0
+    local v4_addresses='[]' v6_addresses='[]' domain_list='[]' group_json='[]'
     ui_hint
     read_rule_index index || return $?
-    if ! jq -e --argjson i "$index" '(.rules[$i].sources.ipv4 + .rules[$i].sources.ipv6 + (.rules[$i].sources.domains // [])) | length > 0' "$CONFIG_FILE" >/dev/null; then
-        warn "该规则没有直接来源，绑定的 IP Group 请使用[解绑 IP Group]。"
+    if ! jq -e --argjson i "$index" \
+      '(.rules[$i].sources.ipv4 + .rules[$i].sources.ipv6 + (.rules[$i].sources.domains // []) + .rules[$i].groups) | length > 0' \
+      "$CONFIG_FILE" >/dev/null; then
+        warn "该规则还没有任何白名单来源。"
         return 0
     fi
     show_rule_sources "$index"
-    prompt_mixed_sources v4_addresses v6_addresses domain_list \
-      '请输入要移除的 IP/CIDR 或域名（多个用逗号分隔）：' || return $?
+    while true; do
+        prompt_select source_kind '请选择要移除的来源类型：' \
+          'direct:移除 IP/CIDR 或域名' 'group:解绑 IP Group' || return "$PROMPT_CANCEL"
+        status=0
+        case "$source_kind" in
+            direct)
+                if ! jq -e --argjson i "$index" \
+                  '(.rules[$i].sources.ipv4 + .rules[$i].sources.ipv6 + (.rules[$i].sources.domains // [])) | length > 0' \
+                  "$CONFIG_FILE" >/dev/null; then
+                    warn "该规则没有直接来源，只绑定了 IP Group。"
+                    continue
+                fi
+                prompt_mixed_sources v4_addresses v6_addresses domain_list \
+                  '请输入要移除的 IP/CIDR 或域名（多个用逗号分隔）：' || status=$?
+                ;;
+            group)
+                prompt_bound_groups "$index" group_json || status=$?
+                ;;
+        esac
+        if (( status == PROMPT_CANCEL )); then return "$PROMPT_CANCEL"; fi
+        if (( status == 0 )); then break; fi
+    done
     config_edit rule-source-remove --argjson i "$index" --argjson v4 "$v4_addresses" \
-      --argjson v6 "$v6_addresses" --argjson domains "$domain_list" \
+      --argjson v6 "$v6_addresses" --argjson domains "$domain_list" --argjson groups "$group_json" \
       '.rules[$i].sources.ipv4 -= $v4 | .rules[$i].sources.ipv6 -= $v6 |
-       .rules[$i].sources.domains = ((.rules[$i].sources.domains // []) - $domains)'
+       .rules[$i].sources.domains = ((.rules[$i].sources.domains // []) - $domains) |
+       .rules[$i].groups -= $groups'
     info "已移除所选来源。请返回主菜单选择 [2] 应用配置。"
 }
 
-attach_rule_group() {
-    local index="" group=""
-    ui_hint
-    read_rule_index index || return $?
-    prompt_existing_group group || return $?
-    config_edit rule-group-attach --argjson i "$index" --arg group "$group" \
-      '.rules[$i].groups = ((.rules[$i].groups + [$group]) | unique)'
-    info "已绑定 IP Group：${group}。请返回主菜单选择 [2] 应用配置。"
-}
-
-detach_rule_group() {
-    local index="" group=""
-    ui_hint
-    read_rule_index index || return $?
-    if ! jq -e --argjson i "$index" '.rules[$i].groups | length > 0' "$CONFIG_FILE" >/dev/null; then
+# 从该规则当前绑定的 Group 中选择要解绑的项，支持逗号分隔多选。
+prompt_bound_groups() {
+    local _pbg_index="$1" _pbg_target="$2" _pbg_text _pbg_candidate _pbg_group _pbg_missing
+    if ! jq -e --argjson i "$_pbg_index" '.rules[$i].groups | length > 0' "$CONFIG_FILE" >/dev/null; then
         warn "该规则没有绑定任何 IP Group。"
-        return 0
+        return 1
     fi
-    ui_note "当前绑定：$(jq -r --argjson i "$index" '.rules[$i].groups | join("、")' "$CONFIG_FILE")"
+    ui_note "当前绑定：$(jq -r --argjson i "$_pbg_index" '.rules[$i].groups | join("、")' "$CONFIG_FILE")"
     while true; do
-        prompt_input group '请输入要解绑的 IP Group 名称：' || return "$PROMPT_CANCEL"
-        if jq -e --argjson i "$index" --arg group "$group" '.rules[$i].groups | index($group) != null' "$CONFIG_FILE" >/dev/null; then
-            break
+        _pbg_text=""
+        prompt_input _pbg_text '请输入要解绑的 IP Group 名称（多个用逗号分隔）：' || return "$PROMPT_CANCEL"
+        _pbg_candidate="$(printf '%s' "$_pbg_text" | tr ',' '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//;/^$/d' | jq -R . | jq -s 'unique')"
+        if [[ "$(jq 'length' <<<"$_pbg_candidate")" -eq 0 ]]; then
+            warn "IP Group 名称不能为空，请重新输入。"
+            continue
         fi
-        warn "该规则未绑定：${group}，请重新输入。"
+        _pbg_missing=""
+        while IFS= read -r _pbg_group; do
+            if ! jq -e --argjson i "$_pbg_index" --arg group "$_pbg_group" '.rules[$i].groups | index($group) != null' "$CONFIG_FILE" >/dev/null; then
+                _pbg_missing="$_pbg_group"
+                break
+            fi
+        done < <(jq -r '.[]' <<<"$_pbg_candidate")
+        if [[ -n "$_pbg_missing" ]]; then
+            warn "该规则未绑定：${_pbg_missing}，请重新输入。"
+            continue
+        fi
+        printf -v "$_pbg_target" '%s' "$_pbg_candidate"
+        return 0
     done
-    config_edit rule-group-detach --argjson i "$index" --arg group "$group" '.rules[$i].groups -= [$group]'
-    info "已解绑 IP Group：${group}。请返回主菜单选择 [2] 应用配置。"
 }
 
 delete_rule() {
@@ -1648,10 +1698,8 @@ protected_ports_menu() {
         ui_item 2 '添加端口保护' '设置协议与端口，绑定白名单'
         ui_item 3 '编辑规则' '修改名称、端口、协议或默认策略'
         ui_item 4 '删除规则' '移除一条端口保护规则'
-        ui_item 5 '添加白名单' '为规则批量添加 IP/CIDR'
-        ui_item 6 '删除白名单' '从规则中移除 IP/CIDR'
-        ui_item 7 '绑定 IP Group' '复用 Group 中的 IPv4/IPv6 地址'
-        ui_item 8 '解绑 IP Group' '停止引用指定 Group'
+        ui_item 5 '添加白名单' '添加 IP/CIDR、域名或绑定 IP Group'
+        ui_item 6 '删除白名单' '移除来源或解绑 IP Group'
         ui_item 0 '返回主菜单'
         ui_prompt
         read -r choice || return 0
@@ -1663,8 +1711,6 @@ protected_ports_menu() {
             4) run_tui_action delete_rule ;;
             5) run_tui_action add_rule_source ;;
             6) run_tui_action remove_rule_source ;;
-            7) run_tui_action attach_rule_group ;;
-            8) run_tui_action detach_rule_group ;;
             0) return 0 ;;
             *) warn "无效选项，请重新选择。" ;;
         esac
