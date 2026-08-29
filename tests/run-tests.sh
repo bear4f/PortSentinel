@@ -18,6 +18,9 @@ tests=(
   test-ip-group-batch.sh
   test-ssh-protection.sh
   test-backup-restore.sh
+  test-backup-keep.sh
+  test-empty-ruleset.sh
+  test-signal-rollback.sh
   test-dry-run.sh
   test-apply-idempotent.sh
   test-rollback.sh

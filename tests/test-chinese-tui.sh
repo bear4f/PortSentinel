@@ -13,7 +13,7 @@ run_tui() {
 
 output="$(printf '0\n' | run_tui)"
 [[ "$output" == *'Linux 双栈端口白名单管理工具'* ]]
-[[ "$output" == *'v1.3.0'* ]]
+[[ "$output" == *'v1.3.1'* ]]
 [[ "$output" == *'运行状态'* ]]
 [[ "$output" == *'常用操作'* ]]
 [[ "$output" == *'策略管理'* ]]

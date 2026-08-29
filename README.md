@@ -225,7 +225,10 @@ PortSentinel 不会对内置链执行无目标的 `iptables -F`、`iptables -X`�
 5. 分别构建完整的 `PORTSENTINEL_NEW` 临时链。
 6. 将 `INPUT` jump 切换到新链，删除不再引用的旧私有链。
 7. 把临时链重命名为正式的 `PORTSENTINEL`。
-8. 任意一侧失败或进程收到 `INT`/`TERM` 时，用 `iptables-restore` 和 `ip6tables-restore` 同时恢复两套备份。
+8. 任意一侧失败或进程收到 `INT`/`TERM` 时，用 `iptables-restore` 和 `ip6tables-restore` 同时恢复两套备份；命令行和交互式面板两条路径都会回滚。
+9. 回滚结果如实上报：回滚成功会给出所用备份编号，回滚失败会明确要求手动恢复，不会笼统地宣称"均已回滚"。
+
+如果配置中已经没有任何受保护端口，Apply 会把防火墙收敛到同一状态：移除 `INPUT` 跳转和 PortSentinel 私有链，而不是保留上一次生效的规则。交互式执行时会先确认，`--non-interactive` 则直接收敛，`--dry-run` 只说明将要移除的内容。
 
 候选链在被引用前已经完整构建，因此重复执行 Apply 不会产生重复 jump 或重复规则。完整防火墙 restore 只用于失败回滚或用户主动恢复备份，正常 Apply 不会重建系统其他规则。
 
@@ -274,12 +277,14 @@ Dry Run 会验证配置并分别打印 `===== IPv4 =====` 和 `===== IPv6 =====`
 /etc/portsentinel/backups/20260829-003000.ipv6.rules
 ```
 
-默认保留最近 20 组：
+默认保留最近 20 组（可在 `/etc/portsentinel/portsentinel.conf` 中通过 `BACKUP_KEEP` 调整，最小值为 2，以保证本次事务备份不会被轮转删除）：
 
 ```bash
 sudo portsentinel backup
 sudo portsentinel restore 20260829-003000
 ```
+
+恢复完成后，面板的"配置状态"会重新显示为待应用，提醒当前防火墙来自备份、可能与 `config.json` 不一致；`reset` 之后同样如此。
 
 `portsentinel restore` 不带时间戳时会列出全部备份组，直接输入序号即可恢复；安全备份（`*-pre-restore`）同样出现在列表中并可以恢复。Restore 前还会创建一组安全备份，如果 IPv4 或 IPv6 恢复失败，程序会尝试重新恢复该安全备份。
 

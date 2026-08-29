@@ -61,4 +61,24 @@ if portsentinel restore 20200101-000000 >/dev/null 2>&1; then
   exit 1
 fi
 
+# reset 与 restore 之后，"已与防火墙同步" 的标记必须失效。
+portsentinel apply --non-interactive >/dev/null
+[[ -f "$root/etc/.applied" ]]
+portsentinel reset --non-interactive >/dev/null
+[[ ! -f "$root/etc/.applied" ]]
+status="$(portsentinel status)"
+[[ "$status" == *'规则未生效'* ]]
+if [[ "$status" == *'已与防火墙同步'* ]]; then
+  printf 'FAIL: status still claims the firewall matches the config after reset\n' >&2
+  exit 1
+fi
+
+portsentinel apply --non-interactive >/dev/null
+[[ -f "$root/etc/.applied" ]]
+output="$(portsentinel restore "$stamp" 2>&1)"
+[[ "$output" == *'与 config.json 可能不一致'* ]]
+[[ ! -f "$root/etc/.applied" ]]
+panel="$(printf '0\n' | TERM=dumb portsentinel)"
+[[ "$panel" == *'有改动待应用'* ]]
+
 printf 'PASS: %s\n' "$(basename "$0")"

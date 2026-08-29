@@ -13,6 +13,10 @@ op="${1:-}"; shift || true
 if [[ "${FAKE_FAIL_FAMILY:-}" == "$family" && "${FAKE_FAIL_OP:-}" == "$op" ]]; then
   exit 42
 fi
+# 让调用方在这一步收到 SIGINT，用于验证事务操作的信号回滚。
+if [[ "${FAKE_SIGNAL_FAMILY:-}" == "$family" && "${FAKE_SIGNAL_OP:-}" == "$op" ]]; then
+  kill -"${FAKE_SIGNAL_NAME:-INT}" "$PPID" 2>/dev/null || true
+fi
 case "$op" in
   -nL)
     [[ -f "$state/chains/${1}" ]]

@@ -3,7 +3,7 @@
 set -Eeuo pipefail
 umask 077
 
-readonly VERSION="1.3.0"
+readonly VERSION="1.3.1"
 readonly CHAIN="PORTSENTINEL"
 readonly STAGE_CHAIN="PORTSENTINEL_NEW"
 readonly OLD_CHAIN="PORTSENTINEL_OLD"
@@ -31,6 +31,8 @@ if [[ -r "$CONF_FILE" ]]; then
     [[ "$configured_keep" =~ ^[0-9]+$ ]] && BACKUP_KEEP="$configured_keep"
 fi
 [[ "$BACKUP_KEEP" =~ ^[0-9]+$ ]] || BACKUP_KEEP=20
+# 轮转必须保留本次事务备份，否则回滚会失去依据。
+(( BACKUP_KEEP >= 2 )) || BACKUP_KEEP=2
 
 NON_INTERACTIVE=0
 DRY_RUN=0
@@ -278,6 +280,10 @@ ensure_config() {
 mark_config_applied() {
     : >"$APPLIED_MARKER" 2>/dev/null || return 0
     chmod 600 "$APPLIED_MARKER" 2>/dev/null || true
+}
+
+clear_config_applied() {
+    rm -f -- "$APPLIED_MARKER" 2>/dev/null || true
 }
 
 config_is_pending() {
@@ -573,6 +579,10 @@ rotate_backups() {
     local remove_count=$(( ${#sets[@]} - BACKUP_KEEP )) i
     for ((i=0; i<remove_count; i++)); do
         file="${sets[$i]}"; stamp="${file%.ipv4.rules}"
+        # 正在进行的事务备份是回滚的唯一依据，任何情况下都不删除。
+        if [[ -n "$TRANSACTION_BACKUP" && "$(basename "$stamp")" == "$TRANSACTION_BACKUP" ]]; then
+            continue
+        fi
         rm -f -- "${stamp}.ipv4.rules" "${stamp}.ipv6.rules"
     done
 }
@@ -611,23 +621,37 @@ restore_backup_set() {
     fi
 }
 
+# 回滚成功返回 0，失败返回 1；调用方据此决定如何向用户描述结果。
 rollback_transaction() {
     local reason="${1:-failure}"
-    if [[ "$TRANSACTION_ACTIVE" == 1 && -n "$TRANSACTION_BACKUP" ]]; then
-        warn "正在把 IPv4 和 IPv6 回滚到备份 ${TRANSACTION_BACKUP}（${reason}）。"
-        if restore_backup_set "$TRANSACTION_BACKUP"; then
-            log_event rollback success "set=${TRANSACTION_BACKUP} reason=${reason}"
-        else
-            log_event rollback failure "set=${TRANSACTION_BACKUP} reason=${reason}"
-            warn "自动回滚失败，请手动恢复备份 ${TRANSACTION_BACKUP}。"
-        fi
-        TRANSACTION_ACTIVE=0
+    [[ "$TRANSACTION_ACTIVE" == 1 && -n "$TRANSACTION_BACKUP" ]] || return 0
+    TRANSACTION_ACTIVE=0
+    warn "正在把 IPv4 和 IPv6 回滚到备份 ${TRANSACTION_BACKUP}（${reason}）。"
+    if restore_backup_set "$TRANSACTION_BACKUP"; then
+        log_event rollback success "set=${TRANSACTION_BACKUP} reason=${reason}"
+        return 0
     fi
+    log_event rollback failure "set=${TRANSACTION_BACKUP} reason=${reason}"
+    warn "自动回滚失败，请手动恢复备份 ${TRANSACTION_BACKUP}。"
+    return 1
 }
 
-on_signal() { rollback_transaction "signal-$1"; exit 130; }
-trap 'on_signal INT' INT
-trap 'on_signal TERM' TERM
+apply_failed() {
+    local reason="$1" message="$2"
+    if rollback_transaction "$reason"; then
+        die "${message}IPv4 和 IPv6 已回滚到备份 ${TRANSACTION_BACKUP}。"
+    fi
+    die "${message}自动回滚失败，请手动恢复备份 ${TRANSACTION_BACKUP}。"
+}
+
+on_signal() { rollback_transaction "signal-$1" || true; exit 130; }
+
+# 顶层 trap 不会被 ( ) 子 shell 继承，事务操作必须自己再装一次。
+install_transaction_traps() {
+    trap 'on_signal INT' INT
+    trap 'on_signal TERM' TERM
+}
+install_transaction_traps
 
 address_contains() {
     local source="$1" candidate="$2"
@@ -729,6 +753,49 @@ preflight_apply() {
     generate_rules
 }
 
+portsentinel_chain_present() {
+    local binary
+    for binary in "$IPTABLES" "$IP6TABLES"; do
+        command -v "$binary" >/dev/null 2>&1 || continue
+        if family_chain_exists "$binary" "$CHAIN"; then return 0; fi
+    done
+    return 1
+}
+
+# 配置里没有受保护端口时，防火墙也不应该留着上一次的规则。
+apply_empty_ruleset() {
+    if (( DRY_RUN )); then
+        printf '# 配置中没有受保护端口：移除 INPUT jump 与 %s 私有链\n' "$CHAIN"
+        log_event apply-dry-run success "rules=0"
+        return 0
+    fi
+    require_root
+    need_command "$IPTABLES"
+    if ! portsentinel_chain_present; then
+        mark_config_applied
+        info "配置中没有受保护端口，防火墙里也没有 PortSentinel 规则，无需应用。"
+        return 0
+    fi
+    warn "配置中没有受保护端口。应用后会移除全部 PortSentinel 规则，原先受保护的端口将对所有来源开放。"
+    if [[ "$NON_INTERACTIVE" == 0 ]]; then
+        if ! confirm '确认移除全部 PortSentinel 规则？'; then
+            info "已取消应用，防火墙保持不变。"
+            return 0
+        fi
+    fi
+    need_command "$IPTABLES_SAVE"
+    acquire_lock
+    TRANSACTION_BACKUP="$(create_backup)"
+    TRANSACTION_ACTIVE=1
+    if ! remove_family_rules "$IPTABLES" || ! remove_family_rules "$IP6TABLES"; then
+        apply_failed empty-ruleset-failure "移除 PortSentinel 规则失败，"
+    fi
+    TRANSACTION_ACTIVE=0
+    mark_config_applied
+    log_event apply success "rules=0 backup=${TRANSACTION_BACKUP}"
+    info "已移除全部 PortSentinel 规则。备份编号：${TRANSACTION_BACKUP}"
+}
+
 apply_cmd() {
     while (($#)); do
         case "$1" in
@@ -739,10 +806,11 @@ apply_cmd() {
         esac
         shift
     done
+    install_transaction_traps
     [[ -f "$CONFIG_FILE" ]] || { info "配置文件不存在，无需应用。"; return 0; }
     if [[ "$(jq -r '.rules | length' "$CONFIG_FILE" 2>/dev/null || printf invalid)" == 0 ]]; then
-        info "配置中没有受保护端口，无需应用。"
-        return 0
+        apply_empty_ruleset
+        return
     fi
     preflight_apply
     if (( DRY_RUN )); then
@@ -755,23 +823,19 @@ apply_cmd() {
     TRANSACTION_BACKUP="$(create_backup)"
     TRANSACTION_ACTIVE=1
     if ! stage_family "$IPTABLES" RULES_V4 4; then
-        rollback_transaction ipv4-stage-failure
-        die "IPv4 候选规则失败，IPv4 和 IPv6 均已回滚。"
+        apply_failed ipv4-stage-failure "IPv4 候选规则失败，"
     fi
     if (( ! SKIP_IPV6 )); then
         if ! stage_family "$IP6TABLES" RULES_V6 6; then
-            rollback_transaction ipv6-stage-failure
-            die "IPv6 候选规则失败，IPv4 和 IPv6 均已回滚。"
+            apply_failed ipv6-stage-failure "IPv6 候选规则失败，"
         fi
     fi
     if ! switch_family "$IPTABLES" 4; then
-        rollback_transaction ipv4-switch-failure
-        die "IPv4 规则切换失败，IPv4 和 IPv6 均已回滚。"
+        apply_failed ipv4-switch-failure "IPv4 规则切换失败，"
     fi
     if (( ! SKIP_IPV6 )); then
         if ! switch_family "$IP6TABLES" 6; then
-            rollback_transaction ipv6-switch-failure
-            die "IPv6 规则切换失败，IPv4 和 IPv6 均已回滚。"
+            apply_failed ipv6-switch-failure "IPv6 规则切换失败，"
         fi
     fi
     TRANSACTION_ACTIVE=0
@@ -799,7 +863,7 @@ list_backups() {
 }
 
 restore_cmd() {
-    require_root; acquire_lock
+    require_root; install_transaction_traps; acquire_lock
     need_command "$IPTABLES_RESTORE"
     command -v "$IP6TABLES_RESTORE" >/dev/null 2>&1 || warn "找不到 ${IP6TABLES_RESTORE}，包含 IPv6 规则的备份将无法恢复。"
     local stamp="${1:-}" selection="" index
@@ -830,11 +894,15 @@ restore_cmd() {
     TRANSACTION_BACKUP="$safety"; TRANSACTION_ACTIVE=1
     if restore_backup_set "$stamp"; then
         TRANSACTION_ACTIVE=0
+        clear_config_applied
         log_event restore success "set=${stamp} safety=${safety}"
         info "已恢复 IPv4 和 IPv6 备份组：$stamp"
+        info "当前防火墙来自备份，与 config.json 可能不一致，请按需重新应用配置。"
     else
-        rollback_transaction restore-failure
-        die "恢复失败，已重新恢复操作前的防火墙状态。"
+        if rollback_transaction restore-failure; then
+            die "恢复失败，已重新恢复操作前的防火墙状态。"
+        fi
+        die "恢复失败，且回滚同样失败，请手动恢复备份 ${safety}。"
     fi
 }
 
@@ -861,6 +929,7 @@ reset_cmd() {
     acquire_lock
     remove_family_rules "$IPTABLES"
     remove_family_rules "$IP6TABLES"
+    clear_config_applied
     log_event reset success
     info "已删除 PortSentinel 的 INPUT jump 和私有链，配置文件已保留。"
 }
