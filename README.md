@@ -35,6 +35,7 @@ sudo bash install-portsentinel.sh
 - 支持 TCP、UDP 和 TCP+UDP。
 - 使用 Python `ipaddress` 严格验证 IPv4、IPv6 和 CIDR。
 - 支持可被多个端口复用的 IP Group。
+- 支持域名来源：保存域名本身，每次 Apply 前重新解析，适合 IP 会变的中转机。
 - 仅管理独立的 `PORTSENTINEL` 链，不清空系统防火墙。
 - 使用临时链安全切换策略，失败时执行双栈成对回滚。
 - 根据 `SSH_CONNECTION`、`SSH_CLIENT` 和 `ss -lntp` 防止 SSH 锁死。
@@ -176,20 +177,82 @@ sudo PORTSENTINEL_SOURCE_DIR="$PWD" bash install.sh
 - 单端口（如 `10773`）或范围（如 `20000:20100`）。
 - 可复用的 IP Group。
 - IPv4 和 IPv6 自定义来源。
+- 域名来源（可选）。
 - IPv4 和 IPv6 各自独立的默认策略。
 
-支持的地址格式：
+支持的来源格式：
 
 ```text
 IPv4:      192.0.2.10
 IPv4 CIDR: 198.51.100.0/24
 IPv6:      2001:db8::10
 IPv6 CIDR: 2001:db8:1234::/48
+域名:      relay.example.com
 ```
 
 IPv4 支持 `/0` 到 `/32`，IPv6 支持 `/0` 到 `/128`。IPv4 地址只会进入 `iptables`，IPv6 地址只会进入 `ip6tables`。无效地址、重复名称、缺失 Group、重复来源、无效端口以及协议和端口范围重叠都会在接触防火墙前被拒绝。
 
-一个 IP Group 可以同时保存 IPv4 和 IPv6 来源，并绑定到任意数量的受保护端口。修改 Group 后，所有引用该 Group 的端口会在下次 Apply 时自动继承新地址。
+一个 IP Group 可以同时保存 IPv4、IPv6 和域名来源，并绑定到任意数量的受保护端口。修改 Group 后，所有引用该 Group 的端口会在下次 Apply 时自动继承新来源。
+
+### 域名来源
+
+在任何"添加来源"的输入框里可以直接填写域名，与 IP/CIDR 混在一行、用逗号分隔：
+
+```text
+  请输入要添加的 IP/CIDR 或域名（多个用逗号分隔）： relay.example.com, 198.51.100.9
+    relay.example.com → IPv4 203.0.113.21 IPv6 2001:db8::21
+  ✓ 已识别 IPv4 1 个、IPv6 0 个、域名 1 个来源。
+```
+
+配置文件里保存的是**域名本身**，不是解析出来的 IP：
+
+```json
+{"groups":{"relay":{"ipv4":["198.51.100.9"],"ipv6":[],"domains":["relay.example.com"]}}}
+```
+
+因此域名指向新地址后，只要重新 `apply` 就会跟随，不需要改配置。这对 IP 会变的中转机很有用：把中转机的 DDNS 域名放进一个 Group，换机器时不用动 PortSentinel。
+
+工作方式：
+
+- 输入时会立即解析一次，解析不到的域名当场拒绝，不会写进配置。
+- 每次 `apply`（含 `--dry-run`）前会重新解析全部域名，结果缓存在 `/etc/portsentinel/resolved.json`。
+- 解析失败但有历史记录时，沿用上次结果并给出告警，避免白名单被 DNS 故障缩空。
+- 解析失败且没有历史记录时明确告警：该来源不会进入白名单（宁可挡住，也不放行未知地址）。交互式执行会要求确认后才继续。
+- 配置中不再引用的域名会自动从缓存中清理。
+- `PORTSENTINEL_RESOLVER` 可以指定自定义解析程序，`PORTSENTINEL_DNS_TIMEOUT` 控制超时（默认 5 秒）。
+
+随时手动刷新并查看当前解析结果：
+
+```bash
+sudo portsentinel resolve
+```
+
+**两点需要注意。** 其一，白名单的正确性会依赖 DNS —— 解析结果被污染意味着白名单被污染，对安全性要求高的场景请直接使用固定 IP。其二，`portsentinel.service` 在 `network-pre.target` 之前运行，那时 DNS 还不可用，所以开机应用必然走缓存；如果域名对应的地址在关机期间发生了变化，需要等一次联网后的 `apply` 才会更新。需要自动跟随的话可以加一个 timer：
+
+```ini
+# /etc/systemd/system/portsentinel-refresh.service
+[Unit]
+Description=Refresh PortSentinel domain sources
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/portsentinel apply --non-interactive
+```
+
+```ini
+# /etc/systemd/system/portsentinel-refresh.timer
+[Unit]
+Description=Refresh PortSentinel domain sources
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=15min
+
+[Install]
+WantedBy=timers.target
+```
 
 ### IPv6 空白名单保护
 
@@ -262,6 +325,7 @@ sudo portsentinel apply --preserve-current-ssh
 ```bash
 sudo portsentinel apply --dry-run
 sudo portsentinel effective
+sudo portsentinel resolve
 sudo portsentinel list
 sudo portsentinel group list
 ```
@@ -296,7 +360,7 @@ sudo portsentinel restore 20260829-003000
 /usr/local/bin/portsentinel apply --non-interactive
 ```
 
-它不依赖 `iptables-persistent`，也不会等待 `network-online.target`。配置不存在或没有受保护端口时会安全退出；错误可以通过以下命令查看：
+它不依赖 `iptables-persistent`，也不会等待 `network-online.target`。因此使用域名来源时，开机应用会走上一次的解析缓存，参见上文"域名来源"。配置不存在或没有受保护端口时会安全退出；错误可以通过以下命令查看：
 
 ```bash
 sudo systemctl status portsentinel
@@ -344,6 +408,7 @@ portsentinel list
 portsentinel rule list
 portsentinel group list
 portsentinel effective
+portsentinel resolve
 portsentinel apply [--dry-run] [--non-interactive] [--preserve-current-ssh]
 portsentinel backup
 portsentinel restore [TIMESTAMP]
@@ -378,7 +443,9 @@ sudo iptables -S INPUT
 sudo ip6tables -S INPUT
 ```
 
-配置目录由 root 所有，目录权限为 `0700`，JSON 和备份权限为 `0600`。所有地址和端口在作为命令参数前都会经过严格验证，日志只保存操作结果，不记录密码、私钥、Token 或其他凭证。
+使用域名来源时，白名单的正确性额外依赖 DNS 解析结果：解析被污染或被劫持等同于白名单被污染。对安全性要求高的端口建议直接写固定 IP。
+
+配置目录由 root 所有，目录权限为 `0700`，JSON、解析缓存和备份权限为 `0600`。所有地址和端口在作为命令参数前都会经过严格验证，日志只保存操作结果，不记录密码、私钥、Token 或其他凭证。
 
 ## License
 

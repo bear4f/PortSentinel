@@ -13,7 +13,7 @@ run_tui() {
 
 output="$(printf '0\n' | run_tui)"
 [[ "$output" == *'Linux 双栈端口白名单管理工具'* ]]
-[[ "$output" == *'v1.3.1'* ]]
+[[ "$output" == *'v1.4.0'* ]]
 [[ "$output" == *'运行状态'* ]]
 [[ "$output" == *'常用操作'* ]]
 [[ "$output" == *'策略管理'* ]]
@@ -48,7 +48,7 @@ output="$(printf '3\n0\n0\n' | run_tui 2>&1)"
 [[ "$output" == *'受保护端口'* ]]
 [[ "$output" == *'[7] 绑定 IP Group'* ]]
 output="$(printf '4\n0\n0\n' | run_tui 2>&1)"
-[[ "$output" == *'[3] 添加 IP/CIDR'* ]]
+[[ "$output" == *'[3] 添加来源'* ]]
 output="$(printf '6\n0\n0\n' | run_tui 2>&1)"
 [[ "$output" == *'[3] 恢复备份'* ]]
 output="$(printf 'h\n\n0\n' | run_tui 2>&1)"

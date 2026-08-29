@@ -22,9 +22,9 @@ assert_contains 'invalid port stays in current step' "$direct_output" '端口无
 assert_contains 'invalid protocol stays in current step' "$direct_output" '无效选项，请重新选择'
 assert_contains 'numbered protocol picker is shown' "$direct_output" '[3] TCP + UDP'
 assert_contains 'numbered source picker is shown' "$direct_output" '[2] 绑定已有 IP Group'
-assert_contains 'empty direct source stays in current step' "$direct_output" 'IP/CIDR 不能为空，请重新输入'
-assert_contains 'invalid direct source stays in current step' "$direct_output" 'IP/CIDR 无效：not-an-ip'
-assert_contains 'direct source detects address families' "$direct_output" '已识别 IPv4 2 个、IPv6 1 个来源'
+assert_contains 'empty direct source stays in current step' "$direct_output" 'IP/CIDR 或域名不能为空，请重新输入'
+assert_contains 'invalid direct source stays in current step' "$direct_output" 'IP/CIDR 或域名无效：not-an-ip'
+assert_contains 'direct source detects address families' "$direct_output" '已识别 IPv4 2 个、IPv6 1 个、域名 0 个来源'
 assert_success 'direct source rule has expected protocol and port' jq -e '.rules[0].protocol == "both" and .rules[0].port == "10086"' "$CONFIG_FILE"
 assert_success 'direct source stores IPv4 values' jq -e '.rules[0].sources.ipv4 == ["192.0.2.0/24", "8.212.49.31"]' "$CONFIG_FILE"
 assert_success 'direct source stores IPv6 values' jq -e '.rules[0].sources.ipv6 == ["2001:db8::8"]' "$CONFIG_FILE"

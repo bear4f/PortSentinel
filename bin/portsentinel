@@ -3,7 +3,7 @@
 set -Eeuo pipefail
 umask 077
 
-readonly VERSION="1.3.1"
+readonly VERSION="1.4.0"
 readonly CHAIN="PORTSENTINEL"
 readonly STAGE_CHAIN="PORTSENTINEL_NEW"
 readonly OLD_CHAIN="PORTSENTINEL_OLD"
@@ -12,6 +12,9 @@ CONFIG_DIR="${PORTSENTINEL_CONFIG_DIR:-/etc/portsentinel}"
 CONFIG_FILE="${PORTSENTINEL_CONFIG_FILE:-${CONFIG_DIR}/config.json}"
 BACKUP_DIR="${PORTSENTINEL_BACKUP_DIR:-${CONFIG_DIR}/backups}"
 APPLIED_MARKER="${PORTSENTINEL_APPLIED_MARKER:-${CONFIG_DIR}/.applied}"
+RESOLVED_FILE="${PORTSENTINEL_RESOLVED_FILE:-${CONFIG_DIR}/resolved.json}"
+DOMAIN_CACHE_JSON=""
+DNS_TIMEOUT="${PORTSENTINEL_DNS_TIMEOUT:-5}"
 CONF_FILE="${PORTSENTINEL_CONF_FILE:-${CONFIG_DIR}/portsentinel.conf}"
 LOG_FILE="${PORTSENTINEL_LOG_FILE:-/var/log/portsentinel.log}"
 LOCK_FILE="${PORTSENTINEL_LOCK_FILE:-/run/portsentinel.lock}"
@@ -309,6 +312,135 @@ except ValueError as exc:
 PY
 }
 
+validate_domain() {
+    [[ "$1" =~ ^([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}$ ]] && (( ${#1} <= 253 ))
+}
+
+# 解析域名，逐行输出 "<地址族><TAB><地址>"；解析失败返回非零。
+# 设置 PORTSENTINEL_RESOLVER 可以改用自定义解析程序（同样的输出格式）。
+resolve_domain() {
+    if [[ -n "${PORTSENTINEL_RESOLVER:-}" ]]; then
+        "$PORTSENTINEL_RESOLVER" "$1"
+        return
+    fi
+    python3 - "$1" "$DNS_TIMEOUT" <<'PY'
+import signal, socket, sys
+
+domain = sys.argv[1]
+try:
+    timeout = int(sys.argv[2])
+except ValueError:
+    timeout = 5
+
+
+def give_up(_signum, _frame):
+    raise TimeoutError
+
+
+if timeout > 0:
+    signal.signal(signal.SIGALRM, give_up)
+    signal.alarm(timeout)
+try:
+    infos = socket.getaddrinfo(domain, None, type=socket.SOCK_STREAM)
+except (OSError, TimeoutError):
+    raise SystemExit(1)
+finally:
+    if timeout > 0:
+        signal.alarm(0)
+
+found = []
+for family, _type, _proto, _canonical, sockaddr in infos:
+    if family == socket.AF_INET:
+        entry = ("4", sockaddr[0])
+    elif family == socket.AF_INET6:
+        entry = ("6", sockaddr[0].split("%")[0])
+    else:
+        continue
+    if entry not in found:
+        found.append(entry)
+
+if not found:
+    raise SystemExit(1)
+for version, address in found:
+    print(f"{version}\t{address}")
+PY
+}
+
+# 本次运行已经解析出的结果优先于磁盘缓存，这样即使缓存文件不可写
+# （例如非 root 执行 --dry-run），展开来源时用的仍然是最新解析结果。
+domain_cache() {
+    if [[ -n "$DOMAIN_CACHE_JSON" ]]; then
+        printf '%s\n' "$DOMAIN_CACHE_JSON"
+    elif [[ -r "$RESOLVED_FILE" ]] && jq -e 'type == "object" and (.domains | type == "object")' "$RESOLVED_FILE" >/dev/null 2>&1; then
+        cat "$RESOLVED_FILE"
+    else
+        printf '{"domains":{}}\n'
+    fi
+}
+
+config_domains() {
+    jq -r '[(.groups[]?.domains // [])[], (.rules[]?.sources.domains // [])[]] | unique[]' "$CONFIG_FILE"
+}
+
+domain_addresses() {
+    jq -r --arg domain "$1" --arg fam "ipv${2}" \
+      '((.domains[$domain] // {})[$fam] // []) | join("、")' <<<"$(domain_cache)"
+}
+
+# 重新解析配置中出现的全部域名；解析失败时沿用上一次的结果。
+# 返回 0 表示每个域名都有可用地址，返回 1 表示至少有一个域名既解析不到也没有缓存。
+refresh_domain_cache() {
+    local -a domains=()
+    mapfile -t domains < <(config_domains)
+    (( ${#domains[@]} > 0 )) || return 0
+
+    local domain version address stale=0 missing=0
+    local cache updated entry
+    cache="$(domain_cache)"
+    updated="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+    for domain in "${domains[@]}"; do
+        local -a resolved_v4=() resolved_v6=()
+        while IFS=$'\t' read -r version address; do
+            case "$version" in
+                4) resolved_v4+=("$address") ;;
+                6) resolved_v6+=("$address") ;;
+            esac
+        done < <(resolve_domain "$domain" 2>/dev/null || true)
+        if (( ${#resolved_v4[@]} == 0 && ${#resolved_v6[@]} == 0 )); then
+            if jq -e --arg d "$domain" '(.domains[$d].ipv4 // []) + (.domains[$d].ipv6 // []) | length > 0' <<<"$cache" >/dev/null 2>&1; then
+                warn "域名解析失败：${domain}，本次沿用上次解析结果。"
+                stale=1
+            else
+                warn "域名解析失败且没有历史记录：${domain}，该来源本次不会进入白名单。"
+                missing=1
+            fi
+            continue
+        fi
+        entry="$(jq -n --arg updated "$updated" \
+          --argjson v4 "$(json_array_from_values "${resolved_v4[@]}")" \
+          --argjson v6 "$(json_array_from_values "${resolved_v6[@]}")" \
+          '{ipv4:$v4,ipv6:$v6,updated:$updated}')"
+        cache="$(jq --arg domain "$domain" --argjson entry "$entry" '.domains[$domain]=$entry' <<<"$cache")"
+    done
+
+    # 只保留配置中仍然引用的域名。
+    cache="$(jq --argjson keep "$(json_array_from_values "${domains[@]}")" \
+      '.domains |= with_entries(select(.key as $k | $keep | index($k)))' <<<"$cache")"
+
+    DOMAIN_CACHE_JSON="$cache"
+
+    local temp=""
+    if temp="$(mktemp "${RESOLVED_FILE}.XXXXXX" 2>/dev/null)"; then
+        printf '%s\n' "$cache" >"$temp"
+        chmod 600 "$temp"
+        mv -f "$temp" "$RESOLVED_FILE"
+    else
+        warn "无法写入解析缓存 ${RESOLVED_FILE}，本次结果只在当前运行内有效。"
+    fi
+    log_event resolve success "domains=${#domains[@]} stale=${stale} missing=${missing}"
+    (( missing == 0 ))
+}
+
 validate_port() {
     local spec="$1" first last
     if [[ "$spec" =~ ^([0-9]+)$ ]]; then
@@ -332,7 +464,8 @@ validate_config() {
         (.key | test("^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")) and
         (.value | type == "object") and
         (.value.ipv4 | type == "array" and all(.[]; type == "string")) and
-        (.value.ipv6 | type == "array" and all(.[]; type == "string"))) and
+        (.value.ipv6 | type == "array" and all(.[]; type == "string")) and
+        (.value.domains // [] | type == "array" and all(.[]; type == "string"))) and
       all(.rules[];
         (.name | type == "string" and length > 0 and length <= 80) and
         (.protocol == "tcp" or .protocol == "udp" or .protocol == "both") and
@@ -341,6 +474,7 @@ validate_config() {
         (.sources | type == "object") and
         (.sources.ipv4 | type == "array" and all(.[]; type == "string")) and
         (.sources.ipv6 | type == "array" and all(.[]; type == "string")) and
+        (.sources.domains // [] | type == "array" and all(.[]; type == "string")) and
         (.ipv4_default == "drop" or .ipv4_default == "accept") and
         (.ipv6_default == "drop" or .ipv6_default == "accept")) and
       all(.rules[].groups[]; . as $g | $cfg.groups | has($g))
@@ -360,6 +494,19 @@ def address(value, family, where):
     if obj.version != family:
         raise SystemExit(f"{where} 中的地址族错误：{value!r}")
 
+DOMAIN = re.compile(
+    r"^(?=.{1,253}$)([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}$"
+)
+
+
+def domains(values, where):
+    if len(values) != len(set(values)):
+        raise SystemExit(f"{where} 中存在重复域名")
+    for value in values:
+        if not DOMAIN.fullmatch(value):
+            raise SystemExit(f"{where} 中的域名 {value!r} 无效")
+
+
 def ports(value):
     match = re.fullmatch(r"([0-9]+)(?::([0-9]+))?", value)
     if not match:
@@ -376,6 +523,7 @@ for name, group in cfg["groups"].items():
             raise SystemExit(f"IP Group {name!r} 的 IPv{family} 地址重复")
         for value in values:
             address(value, family, f"IP Group {name!r} IPv{family}")
+    domains(group.get("domains", []), f"IP Group {name!r}")
 
 seen_names = set()
 coverage = {"tcp": [], "udp": []}
@@ -398,6 +546,7 @@ for rule in cfg["rules"]:
             raise SystemExit(f"规则 {rule['name']!r} 中的 IPv{family} 来源重复")
         for value in values:
             address(value, family, f"规则 {rule['name']!r} IPv{family}")
+    domains(rule["sources"].get("domains", []), f"规则 {rule['name']!r}")
 PY
 }
 
@@ -435,10 +584,20 @@ config_edit() {
 
 collect_sources() {
     local rule_index="$1" family="$2"
-    jq -r --argjson i "$rule_index" --arg fam "ipv${family}" '
+    jq -r --argjson i "$rule_index" --arg fam "ipv${family}" --argjson cache "$(domain_cache)" '
       .rules[$i] as $r |
-      ([$r.sources[$fam][]] + [$r.groups[] as $g | .groups[$g][$fam][]]) |
-      unique[]
+      (($r.sources.domains // []) + [$r.groups[] as $g | ((.groups[$g].domains // [])[])]) as $domains |
+      ([$r.sources[$fam][]]
+        + [$r.groups[] as $g | .groups[$g][$fam][]]
+        + [$domains[] as $d | (($cache.domains[$d] // {})[$fam] // [])[]]
+      ) | unique[]
+    ' "$CONFIG_FILE"
+}
+
+collect_domains() {
+    jq -r --argjson i "$1" '
+      .rules[$i] as $r |
+      (($r.sources.domains // []) + [$r.groups[] as $g | ((.groups[$g].domains // [])[])]) | unique[]
     ' "$CONFIG_FILE"
 }
 
@@ -736,6 +895,12 @@ ssh_lockout_check() {
 preflight_apply() {
     require_base_dependencies
     validate_config
+    if ! refresh_domain_cache; then
+        warn "部分域名无法解析，对应来源不会出现在本次白名单中。"
+        if (( ! DRY_RUN )) && [[ "$NON_INTERACTIVE" == 0 ]]; then
+            confirm '仍然使用当前可解析的地址继续应用？' || die "已取消应用，请先修复 DNS 或改用固定 IP。"
+        fi
+    fi
     if (( DRY_RUN )); then generate_rules; return 0; fi
     require_root
     need_command "$IPTABLES"
@@ -987,7 +1152,8 @@ list_rules() {
       "  [\(.key + 1)] \($rule.name)\n" +
       "      协议：\($rule.protocol | protocol_label)    端口：\($rule.port)\n" +
       "      IPv4：直接地址 \($rule.sources.ipv4 | length) 个；Group：\($groups)；\($rule.ipv4_default | policy_label)\n" +
-      "      IPv6：直接地址 \($rule.sources.ipv6 | length) 个；Group：\($groups)；\($rule.ipv6_default | policy_label)\n"
+      "      IPv6：直接地址 \($rule.sources.ipv6 | length) 个；Group：\($groups)；\($rule.ipv6_default | policy_label)\n" +
+      (($rule.sources.domains // []) | if length == 0 then "" else "      域名：\(join("、"))\n" end)
     ' "$CONFIG_FILE"
 }
 
@@ -998,15 +1164,18 @@ list_groups() {
         return
     fi
     ui_section 'IP Group 列表'
-    jq -r '.groups | to_entries[] |
+    jq -r --argjson cache "$(domain_cache)" '
+      def resolved($d): ($cache.domains[$d].ipv4 // []) + ($cache.domains[$d].ipv6 // []);
+      .groups | to_entries[] |
       "  [\(.key)]\n" +
       "      IPv4（\(.value.ipv4|length)）：\(if (.value.ipv4|length) == 0 then "无" else (.value.ipv4|join("、")) end)\n" +
-      "      IPv6（\(.value.ipv6|length)）：\(if (.value.ipv6|length) == 0 then "无" else (.value.ipv6|join("、")) end)\n"' "$CONFIG_FILE"
+      "      IPv6（\(.value.ipv6|length)）：\(if (.value.ipv6|length) == 0 then "无" else (.value.ipv6|join("、")) end)\n" +
+      (((.value.domains // []) | map("      域名 \(.) → \(if (resolved(.)|length) == 0 then "尚未解析" else (resolved(.)|join("、")) end)")) | join("\n") | if . == "" then "" else . + "\n" end)' "$CONFIG_FILE"
 }
 
 effective_rules_cmd() {
     ensure_config; validate_config || die "配置文件无效。"
-    local count index name proto port family default source found
+    local count index name proto port family default source found domain
     count="$(jq '.rules|length' "$CONFIG_FILE")"
     if (( count == 0 )); then
         info "暂无受保护端口规则。"
@@ -1018,6 +1187,10 @@ effective_rules_cmd() {
         port="$(jq -r --argjson i "$index" '.rules[$i].port' "$CONFIG_FILE")"
         ui_section "[$(( index + 1 ))] ${name}"
         ui_field '协议 / 端口' "${proto}/${port}"
+        while IFS= read -r domain; do
+            [[ -n "$domain" ]] || continue
+            ui_field "域名 ${domain}" "IPv4 $(domain_addresses "$domain" 4 | sed 's/^$/无/') · IPv6 $(domain_addresses "$domain" 6 | sed 's/^$/无/')"
+        done < <(collect_domains "$index")
         for family in 4 6; do
             default="$(jq -r --argjson i "$index" --arg key "ipv${family}_default" '.rules[$i][$key]' "$CONFIG_FILE")"
             if [[ "$default" == drop ]]; then default='未匹配时拒绝'; else default='未匹配时放行'; fi
@@ -1054,7 +1227,8 @@ show_group_addresses() {
     jq -r --arg name "$1" '
       .groups[$name] |
       "  IPv4：" + (if (.ipv4|length) == 0 then "无" else (.ipv4|join("、")) end),
-      "  IPv6：" + (if (.ipv6|length) == 0 then "无" else (.ipv6|join("、")) end)' "$CONFIG_FILE"
+      "  IPv6：" + (if (.ipv6|length) == 0 then "无" else (.ipv6|join("、")) end),
+      "  域名：" + (if ((.domains // [])|length) == 0 then "无" else ((.domains // [])|join("、")) end)' "$CONFIG_FILE"
 }
 
 add_group() {
@@ -1072,7 +1246,7 @@ add_group() {
         fi
         break
     done
-    config_edit group-add --arg name "$name" '.groups[$name]={ipv4:[],ipv6:[]}'
+    config_edit group-add --arg name "$name" '.groups[$name]={ipv4:[],ipv6:[],domains:[]}'
     info "已创建 IP Group：${name}。接着可以为它批量添加 IP/CIDR。"
 }
 
@@ -1094,31 +1268,35 @@ prompt_existing_group() {
 }
 
 add_group_address() {
-    local name="" v4_addresses='[]' v6_addresses='[]'
+    local name="" v4_addresses='[]' v6_addresses='[]' domain_list='[]'
     ui_hint
     prompt_existing_group name || return $?
-    prompt_mixed_addresses v4_addresses v6_addresses \
-      '请输入要添加的 IP/CIDR（多个用逗号分隔，可混合 IPv4 和 IPv6）：' || return $?
-    config_edit group-address-add --arg name "$name" --argjson v4 "$v4_addresses" --argjson v6 "$v6_addresses" \
+    prompt_mixed_sources v4_addresses v6_addresses domain_list \
+      '请输入要添加的 IP/CIDR 或域名（多个用逗号分隔）：' || return $?
+    config_edit group-address-add --arg name "$name" --argjson v4 "$v4_addresses" \
+      --argjson v6 "$v6_addresses" --argjson domains "$domain_list" \
       '.groups[$name].ipv4 = ((.groups[$name].ipv4 + $v4) | unique) |
-       .groups[$name].ipv6 = ((.groups[$name].ipv6 + $v6) | unique)'
+       .groups[$name].ipv6 = ((.groups[$name].ipv6 + $v6) | unique) |
+       .groups[$name].domains = (((.groups[$name].domains // []) + $domains) | unique)'
     info "已批量更新 IP Group：${name}。请返回主菜单选择 [2] 应用配置。"
 }
 
 remove_group_address() {
-    local name="" v4_addresses='[]' v6_addresses='[]'
+    local name="" v4_addresses='[]' v6_addresses='[]' domain_list='[]'
     ui_hint
     prompt_existing_group name || return $?
-    if ! jq -e --arg name "$name" '(.groups[$name].ipv4 + .groups[$name].ipv6) | length > 0' "$CONFIG_FILE" >/dev/null; then
-        warn "IP Group ${name} 中还没有地址。"
+    if ! jq -e --arg name "$name" '(.groups[$name].ipv4 + .groups[$name].ipv6 + (.groups[$name].domains // [])) | length > 0' "$CONFIG_FILE" >/dev/null; then
+        warn "IP Group ${name} 中还没有来源。"
         return 0
     fi
     show_group_addresses "$name"
-    prompt_mixed_addresses v4_addresses v6_addresses \
-      '请输入要删除的 IP/CIDR（多个用逗号分隔）：' || return $?
-    config_edit group-address-remove --arg name "$name" --argjson v4 "$v4_addresses" --argjson v6 "$v6_addresses" \
-      '.groups[$name].ipv4 -= $v4 | .groups[$name].ipv6 -= $v6'
-    info "已从 IP Group ${name} 中移除所选地址。请返回主菜单选择 [2] 应用配置。"
+    prompt_mixed_sources v4_addresses v6_addresses domain_list \
+      '请输入要删除的 IP/CIDR 或域名（多个用逗号分隔）：' || return $?
+    config_edit group-address-remove --arg name "$name" --argjson v4 "$v4_addresses" \
+      --argjson v6 "$v6_addresses" --argjson domains "$domain_list" \
+      '.groups[$name].ipv4 -= $v4 | .groups[$name].ipv6 -= $v6 |
+       .groups[$name].domains = ((.groups[$name].domains // []) - $domains)'
+    info "已从 IP Group ${name} 中移除所选来源。请返回主菜单选择 [2] 应用配置。"
 }
 
 rename_group() {
@@ -1166,10 +1344,11 @@ groups_menu() {
         ui_section 'IP Group 管理'
         ui_item 1 '查看 Group' '列出每个 Group 的 IPv4/IPv6 地址'
         ui_item 2 '创建 Group' '创建可被多个端口复用的白名单'
-        ui_item 3 '添加 IP/CIDR' '逗号分隔批量添加，自动识别地址族'
-        ui_item 4 '删除 IP/CIDR' '从指定 Group 中移除一个或多个地址'
+        ui_item 3 '添加来源' '逗号分隔批量添加 IP/CIDR 或域名'
+        ui_item 4 '删除来源' '从指定 Group 中移除一个或多个来源'
         ui_item 5 '重命名 Group' '保留地址并同步更新规则绑定'
         ui_item 6 '删除 Group' '被规则引用时会先给出提示'
+        ui_item 7 '刷新域名解析' '重新解析域名来源并显示当前地址'
         ui_item 0 '返回主菜单'
         ui_prompt
         read -r choice || return 0
@@ -1181,6 +1360,7 @@ groups_menu() {
             4) run_tui_action remove_group_address ;;
             5) run_tui_action rename_group ;;
             6) run_tui_action delete_group ;;
+            7) run_tui_action resolve_cmd ;;
             0) return 0 ;;
             *) warn "无效选项，请重新选择。" ;;
         esac
@@ -1196,17 +1376,19 @@ json_array_from_values() {
     fi
 }
 
-prompt_mixed_addresses() {
-    local _pma_v4_target="$1" _pma_v6_target="$2"
-    local _pma_label="${3:-请输入允许访问的 IP/CIDR（多个用逗号分隔，可混合 IPv4 和 IPv6）：}"
-    local _pma_text _pma_raw _pma_item _pma_invalid
-    local -a _pma_items=() _pma_v4=() _pma_v6=()
+# 一行内混合接受 IPv4 / IPv6 / CIDR / 域名，域名会当场解析确认可用。
+prompt_mixed_sources() {
+    local _pma_v4_target="$1" _pma_v6_target="$2" _pma_domain_target="$3"
+    local _pma_label="${4:-请输入允许访问的 IP/CIDR 或域名（多个用逗号分隔）：}"
+    local _pma_text _pma_raw _pma_item _pma_invalid _pma_reason _pma_version _pma_address
+    local -a _pma_items=() _pma_v4=() _pma_v6=() _pma_domains=() _pma_preview=()
     while true; do
         _pma_text=""
         prompt_input _pma_text "$_pma_label" || return "$PROMPT_CANCEL"
-        _pma_items=(); _pma_v4=(); _pma_v6=(); _pma_invalid=""
+        _pma_items=(); _pma_v4=(); _pma_v6=(); _pma_domains=(); _pma_preview=()
+        _pma_invalid=""; _pma_reason=""
         if [[ -z "$_pma_text" ]]; then
-            warn "IP/CIDR 不能为空，请重新输入。"
+            warn "IP/CIDR 或域名不能为空，请重新输入。"
             continue
         fi
         IFS=',' read -r -a _pma_items <<<"$_pma_text"
@@ -1214,23 +1396,38 @@ prompt_mixed_addresses() {
             _pma_item="${_pma_raw#"${_pma_raw%%[![:space:]]*}"}"
             _pma_item="${_pma_item%"${_pma_item##*[![:space:]]}"}"
             if [[ -z "$_pma_item" ]]; then
-                _pma_invalid="空值"
+                _pma_invalid="空值"; _pma_reason=empty
             elif validate_address "$_pma_item" 4 >/dev/null 2>&1; then
                 _pma_v4+=("$_pma_item")
             elif validate_address "$_pma_item" 6 >/dev/null 2>&1; then
                 _pma_v6+=("$_pma_item")
+            elif validate_domain "$_pma_item"; then
+                _pma_preview=()
+                while IFS=$'\t' read -r _pma_version _pma_address; do
+                    [[ -n "$_pma_address" ]] && _pma_preview+=("IPv${_pma_version} ${_pma_address}")
+                done < <(resolve_domain "$_pma_item" 2>/dev/null || true)
+                if (( ${#_pma_preview[@]} == 0 )); then
+                    _pma_invalid="$_pma_item"; _pma_reason=dns
+                else
+                    _pma_domains+=("$_pma_item")
+                    ui_note "  ${_pma_item} → ${_pma_preview[*]}"
+                fi
             else
-                _pma_invalid="$_pma_item"
+                _pma_invalid="$_pma_item"; _pma_reason=syntax
             fi
             [[ -z "$_pma_invalid" ]] || break
         done
         if [[ -n "$_pma_invalid" ]]; then
-            warn "IP/CIDR 无效：${_pma_invalid}，请重新输入整组地址。"
+            case "$_pma_reason" in
+                dns) warn "域名解析失败：${_pma_invalid}，请检查 DNS 或改填具体 IP。" ;;
+                *) warn "IP/CIDR 或域名无效：${_pma_invalid}，请重新输入整组来源。" ;;
+            esac
             continue
         fi
         printf -v "$_pma_v4_target" '%s' "$(json_array_from_values "${_pma_v4[@]}")"
         printf -v "$_pma_v6_target" '%s' "$(json_array_from_values "${_pma_v6[@]}")"
-        info "已识别 IPv4 ${#_pma_v4[@]} 个、IPv6 ${#_pma_v6[@]} 个来源。"
+        printf -v "$_pma_domain_target" '%s' "$(json_array_from_values "${_pma_domains[@]}")"
+        info "已识别 IPv4 ${#_pma_v4[@]} 个、IPv6 ${#_pma_v6[@]} 个、域名 ${#_pma_domains[@]} 个来源。"
         return 0
     done
 }
@@ -1268,7 +1465,7 @@ prompt_rule_groups() {
 
 add_rule() {
     local name="" port="" protocol="" source_kind="" status=0
-    local group_json='[]' v4_sources='[]' v6_sources='[]'
+    local group_json='[]' v4_sources='[]' v6_sources='[]' domain_sources='[]'
     ui_hint
     while true; do
         prompt_input name '请输入规则名称（例如 snell）：' || return "$PROMPT_CANCEL"
@@ -1283,10 +1480,10 @@ add_rule() {
     prompt_select protocol '请选择协议：' 'tcp:TCP' 'udp:UDP' 'both:TCP + UDP' || return "$PROMPT_CANCEL"
     while true; do
         prompt_select source_kind '请选择白名单来源：' \
-          'direct:直接输入 IP/CIDR' 'group:绑定已有 IP Group' 'none:暂不添加来源（拒绝所有访问）' || return "$PROMPT_CANCEL"
+          'direct:直接输入 IP/CIDR 或域名' 'group:绑定已有 IP Group' 'none:暂不添加来源（拒绝所有访问）' || return "$PROMPT_CANCEL"
         status=0
         case "$source_kind" in
-            direct) prompt_mixed_addresses v4_sources v6_sources || status=$? ;;
+            direct) prompt_mixed_sources v4_sources v6_sources domain_sources || status=$? ;;
             group) prompt_rule_groups group_json || status=$? ;;
         esac
         if (( status == PROMPT_CANCEL )); then return "$PROMPT_CANCEL"; fi
@@ -1295,8 +1492,8 @@ add_rule() {
 
     config_edit rule-add --arg name "$name" --arg protocol "$protocol" --arg port "$port" \
       --argjson groups "$group_json" --argjson v4 "$v4_sources" --argjson v6 "$v6_sources" \
-      --arg d4 drop --arg d6 drop \
-      '.rules += [{name:$name,protocol:$protocol,port:$port,groups:$groups,sources:{ipv4:$v4,ipv6:$v6},ipv4_default:$d4,ipv6_default:$d6}]'
+      --argjson domains "$domain_sources" --arg d4 drop --arg d6 drop \
+      '.rules += [{name:$name,protocol:$protocol,port:$port,groups:$groups,sources:{ipv4:$v4,ipv6:$v6,domains:$domains},ipv4_default:$d4,ipv6_default:$d6}]'
     info "规则已保存。请返回主菜单选择 [2] 应用配置。"
 }
 
@@ -1326,7 +1523,8 @@ read_rule_index() {
 show_rule_sources() {
     jq -r --argjson i "$1" '.rules[$i] |
       "  IPv4：" + (if (.sources.ipv4|length) == 0 then "无" else (.sources.ipv4|join("、")) end),
-      "  IPv6：" + (if (.sources.ipv6|length) == 0 then "无" else (.sources.ipv6|join("、")) end)' "$CONFIG_FILE"
+      "  IPv6：" + (if (.sources.ipv6|length) == 0 then "无" else (.sources.ipv6|join("、")) end),
+      "  域名：" + (if ((.sources.domains // [])|length) == 0 then "无" else ((.sources.domains // [])|join("、")) end)' "$CONFIG_FILE"
 }
 
 edit_rule() {
@@ -1366,30 +1564,34 @@ edit_rule() {
 }
 
 add_rule_source() {
-    local index="" v4_addresses='[]' v6_addresses='[]'
+    local index="" v4_addresses='[]' v6_addresses='[]' domain_list='[]'
     ui_hint
     read_rule_index index || return $?
-    prompt_mixed_addresses v4_addresses v6_addresses \
-      '请输入要加入白名单的 IP/CIDR（多个用逗号分隔，可混合 IPv4 和 IPv6）：' || return $?
-    config_edit rule-source-add --argjson i "$index" --argjson v4 "$v4_addresses" --argjson v6 "$v6_addresses" \
+    prompt_mixed_sources v4_addresses v6_addresses domain_list \
+      '请输入要加入白名单的 IP/CIDR 或域名（多个用逗号分隔）：' || return $?
+    config_edit rule-source-add --argjson i "$index" --argjson v4 "$v4_addresses" \
+      --argjson v6 "$v6_addresses" --argjson domains "$domain_list" \
       '.rules[$i].sources.ipv4 = ((.rules[$i].sources.ipv4 + $v4) | unique) |
-       .rules[$i].sources.ipv6 = ((.rules[$i].sources.ipv6 + $v6) | unique)'
+       .rules[$i].sources.ipv6 = ((.rules[$i].sources.ipv6 + $v6) | unique) |
+       .rules[$i].sources.domains = (((.rules[$i].sources.domains // []) + $domains) | unique)'
     info "来源已添加。请返回主菜单选择 [2] 应用配置。"
 }
 
 remove_rule_source() {
-    local index="" v4_addresses='[]' v6_addresses='[]'
+    local index="" v4_addresses='[]' v6_addresses='[]' domain_list='[]'
     ui_hint
     read_rule_index index || return $?
-    if ! jq -e --argjson i "$index" '(.rules[$i].sources.ipv4 + .rules[$i].sources.ipv6) | length > 0' "$CONFIG_FILE" >/dev/null; then
+    if ! jq -e --argjson i "$index" '(.rules[$i].sources.ipv4 + .rules[$i].sources.ipv6 + (.rules[$i].sources.domains // [])) | length > 0' "$CONFIG_FILE" >/dev/null; then
         warn "该规则没有直接来源，绑定的 IP Group 请使用[解绑 IP Group]。"
         return 0
     fi
     show_rule_sources "$index"
-    prompt_mixed_addresses v4_addresses v6_addresses \
-      '请输入要移除的 IP/CIDR（多个用逗号分隔）：' || return $?
-    config_edit rule-source-remove --argjson i "$index" --argjson v4 "$v4_addresses" --argjson v6 "$v6_addresses" \
-      '.rules[$i].sources.ipv4 -= $v4 | .rules[$i].sources.ipv6 -= $v6'
+    prompt_mixed_sources v4_addresses v6_addresses domain_list \
+      '请输入要移除的 IP/CIDR 或域名（多个用逗号分隔）：' || return $?
+    config_edit rule-source-remove --argjson i "$index" --argjson v4 "$v4_addresses" \
+      --argjson v6 "$v6_addresses" --argjson domains "$domain_list" \
+      '.rules[$i].sources.ipv4 -= $v4 | .rules[$i].sources.ipv6 -= $v6 |
+       .rules[$i].sources.domains = ((.rules[$i].sources.domains // []) - $domains)'
     info "已移除所选来源。请返回主菜单选择 [2] 应用配置。"
 }
 
@@ -1504,6 +1706,30 @@ show_backups() {
     local stamp
     ui_note "共 ${#stamps[@]} 组备份（最新在前）："
     for stamp in "${stamps[@]}"; do printf '  %s\n' "$stamp"; done
+}
+
+resolve_cmd() {
+    ensure_config
+    validate_config || die "配置文件无效。"
+    local -a domains=()
+    mapfile -t domains < <(config_domains)
+    if (( ${#domains[@]} == 0 )); then
+        info "配置中没有使用域名来源。"
+        return 0
+    fi
+    require_root
+    local status=0
+    refresh_domain_cache || status=$?
+    ui_section '域名解析结果'
+    local domain
+    for domain in "${domains[@]}"; do
+        ui_field "$domain" "IPv4 $(domain_addresses "$domain" 4 | sed 's/^$/无/') · IPv6 $(domain_addresses "$domain" 6 | sed 's/^$/无/')"
+    done
+    if (( status != 0 )); then
+        warn "存在无法解析且没有历史记录的域名，应用后对应来源不会进入白名单。"
+        return 1
+    fi
+    info "解析结果已更新。请选择 [2] 应用配置写入防火墙。"
 }
 
 update_cmd() {
@@ -1625,6 +1851,7 @@ usage() {
   list | rule list          列出受保护端口规则
   group list                列出可复用的 IP Group
   effective                 查看展开后的白名单与计数器
+  resolve                   重新解析配置中的域名并显示结果
   apply [选项]              校验并以事务方式应用 IPv4/IPv6 策略
   backup                    保存成对的 IPv4/IPv6 防火墙备份
   restore [时间戳]          恢复一组成对备份，缺省时可交互选择
@@ -1655,6 +1882,7 @@ main() {
         rule) [[ "${1:-}" == list ]] || die "用法：portsentinel rule list"; list_rules;;
         group) [[ "${1:-}" == list ]] || die "用法：portsentinel group list"; list_groups;;
         effective) effective_rules_cmd;;
+        resolve) resolve_cmd;;
         apply) apply_cmd "$@";;
         backup) backup_cmd "$@";;
         restore) restore_cmd "$@";;

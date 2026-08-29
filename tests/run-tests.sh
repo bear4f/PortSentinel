@@ -16,6 +16,7 @@ tests=(
   test-add-rule-flow.sh
   test-tui-input-retry.sh
   test-ip-group-batch.sh
+  test-domain-sources.sh
   test-ssh-protection.sh
   test-backup-restore.sh
   test-backup-keep.sh

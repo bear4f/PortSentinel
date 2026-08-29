@@ -16,9 +16,9 @@ INPUT
 
 assert_contains 'invalid rule ID is retried' "$retry_output" '规则 ID 无效，请输入 1-1'
 assert_contains 'rule picker lists rules' "$retry_output" '[1] Snell  ·  TCP+UDP/10086'
-assert_contains 'empty address is retried' "$retry_output" 'IP/CIDR 不能为空，请重新输入'
-assert_contains 'invalid address is retried' "$retry_output" 'IP/CIDR 无效：not-an-ip'
-assert_contains 'address families are detected' "$retry_output" '已识别 IPv4 1 个、IPv6 1 个来源'
+assert_contains 'empty address is retried' "$retry_output" 'IP/CIDR 或域名不能为空，请重新输入'
+assert_contains 'invalid address is retried' "$retry_output" 'IP/CIDR 或域名无效：not-an-ip'
+assert_contains 'address families are detected' "$retry_output" '已识别 IPv4 1 个、IPv6 1 个、域名 0 个来源'
 assert_contains 'successful retry reports saved source' "$retry_output" '来源已添加'
 assert_success 'valid addresses are stored after retries' jq -e '.rules[0].sources.ipv4 == ["8.212.49.31"] and .rules[0].sources.ipv6 == ["2001:db8::5"]' "$CONFIG_FILE"
 

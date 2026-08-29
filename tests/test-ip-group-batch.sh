@@ -15,9 +15,9 @@ EOF
 )"
 
 assert_contains 'missing group is retried' "$batch_output" '找不到 IP Group：missing'
-assert_contains 'empty batch is retried' "$batch_output" 'IP/CIDR 不能为空，请重新输入'
-assert_contains 'invalid batch is retried' "$batch_output" 'IP/CIDR 无效：not-an-ip'
-assert_contains 'mixed families are detected' "$batch_output" '已识别 IPv4 2 个、IPv6 2 个来源'
+assert_contains 'empty batch is retried' "$batch_output" 'IP/CIDR 或域名不能为空，请重新输入'
+assert_contains 'invalid batch is retried' "$batch_output" 'IP/CIDR 或域名无效：not-an-ip'
+assert_contains 'mixed families are detected' "$batch_output" '已识别 IPv4 2 个、IPv6 2 个、域名 0 个来源'
 assert_contains 'batch update reports success' "$batch_output" '已批量更新 IP Group：office'
 assert_success 'IPv4 group addresses are merged and deduplicated' jq -e '.groups.office.ipv4 == ["192.0.2.0/24", "8.212.49.31"]' "$CONFIG_FILE"
 assert_success 'IPv6 group addresses are stored' jq -e '.groups.office.ipv6 == ["2001:db8:1::/64", "2001:db8::10"]' "$CONFIG_FILE"
